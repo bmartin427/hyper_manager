@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 
+from matplotlib import pyplot
 import numpy
 from PySide2 import QtCore, QtGui, QtWidgets
 from tensorboard.backend.event_processing.event_accumulator \
@@ -26,13 +27,11 @@ _CMDLINE = [os.path.join(_ROOT_DIR, 'training.py'),
 
 
 def _parse_logs(logs_dir):
-    """Reads a tensorboard log dir and returns a tuple of three elements:
-     * Minimum validation loss in the log.
-     * Validation loss at the end of the log.
-     * The rate at which the validation loss was changing towards the end of
-       the log, per minute of training time.
+    """Reads a tensorboard log directory.
 
-    Returns three Nones if no logs are present at the given location.
+    Returns an Nx2 numpy array, where the first column is the amount of
+    training time, and the second column is the validation loss, for each of
+    the N logged events in the log.
     """
     rel_time = 0.
     full_log = None
@@ -56,8 +55,21 @@ def _parse_logs(logs_dir):
             rel_time += loss[-1].wall_time - loss[0].wall_time
     except FileNotFoundError:
         pass
+    return full_log
+
+
+def _get_loss_stats(full_log):
+    """Given the result of _parse_logs(), returns a tuple of four elements:
+     * Minimum validation loss in the log.
+     * Validation loss at the end of the log.
+     * The rate at which the validation loss was changing towards the end of
+       the log, per minute of training time.
+     * The intercept of the linear fit used to estimate the loss rate.
+
+    Returns four Nones if there is no input log data.
+    """
     if full_log is None:
-        return None, None, None
+        return None, None, None, None
 
     min_loss = numpy.amin(full_log[:, 1])
     cur_loss = full_log[-1, 1]
@@ -69,8 +81,9 @@ def _parse_logs(logs_dir):
     B = W * full_log[:, 1:2]
     p, _, _, _ = numpy.linalg.lstsq(A, B, rcond=None)
     loss_rate = p[0][0] * 60.  # Per minute not per second.
+    loss_intercept = p[1][0]
 
-    return min_loss, cur_loss, loss_rate
+    return min_loss, cur_loss, loss_rate, loss_intercept
 
 
 class ManagerState(QtCore.QObject):
@@ -169,6 +182,10 @@ class ManagerState(QtCore.QObject):
         assert self._running_set_key is None
         self._console_text = 'Not running'
 
+    def get_loss_history(self, key):
+        return _parse_logs(
+            os.path.join(self._session_path, key, project_paths.LOGS_DIR))
+
     # QObject override
     def timerEvent(self, _):
         if not self.running:
@@ -262,11 +279,10 @@ class ManagerState(QtCore.QObject):
             self._subprocess_log.close()
             self._subprocess = None
             running_set['this_run_s'] = None
+            # (Discard the intercept.)
             for k, v in zip(
                     ['min_test_loss', 'cur_test_loss', 'test_loss_rate'],
-                    _parse_logs(os.path.join(self._session_path,
-                                             running_set_key,
-                                             project_paths.LOGS_DIR))):
+                    _get_loss_stats(self.get_loss_history(running_set_key))):
                 running_set[k] = v
             self._running_set_key = None
             self._last_time = None
@@ -401,11 +417,11 @@ class HypersetTable(QtWidgets.QTableView):
             self.addAction(action)
             return action
 
-        self._queue_set_action = add_action(
-            'Queue set(s) for running', self.handle_queue_set)
         self._disable_set_action = add_action(
-            'Disable set(s) from running', self.handle_disable_set)
+            'Disable set(s) from running', self._handle_disable_set)
         self._disable_set_action.setCheckable(True)
+        self._plot_loss_action = add_action(
+            'Plot validation loss(es)', self._handle_plot_loss)
 
         self._selected_keys = []
 
@@ -427,16 +443,35 @@ class HypersetTable(QtWidgets.QTableView):
             if self._selected_keys else False)
         self.selection_updated_signal.emit()
 
-    def handle_queue_set(self, _):
-        raise NotImplementedError()
-
-    def handle_disable_set(self, checked):
-        for key in self.selected_keys:
-            self._state.disable_hyperset(key, checked)
-
     def _handle_model_reset(self):
         self.clearSelection()
         self._selected_keys = None
+
+    def _handle_disable_set(self, checked):
+        for key in self.selected_keys:
+            self._state.disable_hyperset(key, checked)
+
+    def _handle_plot_loss(self):
+        COLORS = 'cmykrgb'
+        plots = 0
+        for key in (self.selected_keys or self._state.hypersets.keys()):
+            data = self._state.get_loss_history(key)
+            if data is None:
+                continue
+            _, _, rate, intercept = _get_loss_stats(data)
+            if not plots:
+                pyplot.figure()
+            color = COLORS[plots % len(COLORS)]
+            pyplot.plot(data[:, 0], data[:, 1], color=color,
+                        label=self._state.hypersets[key]['args'])
+            pyplot.plot((data[0, 0], data[-1, 0]),
+                        (intercept + rate * data[0, 0] / 60.,
+                         intercept + rate * data[-1, 0] / 60.),
+                        color=color, linestyle='--')
+            plots += 1
+        if plots:
+            pyplot.legend()
+            pyplot.show()
 
 
 class MainWidget(QtWidgets.QSplitter):
