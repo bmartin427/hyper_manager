@@ -91,7 +91,10 @@ class ManagerState(QtCore.QObject):
     _LOG_FILE = 'training.log'
     _OVERWRITTEN_LINE_RE = re.compile('[^\r\n]*\r')
 
-    updated_signal = QtCore.Signal()
+    # The key of a previously-existing hyperset that was updated is passed
+    # through the signal.  If None, the entire table should be treated as
+    # changed.
+    updated_signal = QtCore.Signal(str)
 
     def __init__(self):
         super(ManagerState, self).__init__()
@@ -132,7 +135,7 @@ class ManagerState(QtCore.QObject):
         self._session_path = path
         for setfile in glob.glob(os.path.join(path, '*', self._HYPERSET_FILE)):
             self._load_hyperset(setfile)
-        self.updated_signal.emit()
+        self.updated_signal.emit(None)
 
     def add_hyperset(self, set_args):
         # Create a lookup key for each hyperparam set based on hashing the
@@ -156,12 +159,13 @@ class ManagerState(QtCore.QObject):
         self._hypersets[key] = data
         os.mkdir(os.path.join(self._session_path, key))
         self._write_set_data(key)
-        self.updated_signal.emit()
+        # key didn't previously exist, so reset everything.
+        self.updated_signal.emit(None)
 
     def disable_hyperset(self, key, disabled):
         self._hypersets[key]['disabled'] = disabled
         self._write_set_data(key)
-        self.updated_signal.emit()
+        self.updated_signal.emit(key)
 
     def run_session(self):
         assert not self.running
@@ -288,7 +292,7 @@ class ManagerState(QtCore.QObject):
             self._last_time = None
 
         self._write_set_data(running_set_key)
-        self.updated_signal.emit()
+        self.updated_signal.emit(running_set_key)
         return result is not None
 
     def _choose_runnable_set(self):
@@ -320,7 +324,7 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
         state.updated_signal.connect(self._handle_state_changed)
         self._data = []
         self._disabled = []
-        self._handle_state_changed()
+        self._handle_state_changed(None)
 
     # QAbstractTableModel interface implementation
 
@@ -364,9 +368,7 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
     def get_key(self, row_index):
         return self._data[row_index][self._KEY_COL]
 
-    def _handle_state_changed(self):
-        self.beginResetModel()
-
+    def _handle_state_changed(self, key):
         def fmt_float(f):
             return '%.4g' % f if f is not None else ''
 
@@ -381,12 +383,20 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
                 fmt_float(d['test_loss_rate']),
                 k,
             ]
-        items = self._state.hypersets.items()
-        # TODO sort
-        self._data = [row_data(k, d) for k, d in items]
-        self._disabled = [d['disabled'] for _, d in items]
 
-        self.endResetModel()
+        # TODO sort
+        items = list(self._state.hypersets.items())
+        if (key is None) or (key not in self._state.hypersets):
+            self.beginResetModel()
+            self._data = [row_data(k, d) for k, d in items]
+            self._disabled = [d['disabled'] for _, d in items]
+            self.endResetModel()
+        else:
+            idx = [i for i, x in enumerate(items) if x[0] == key][0]
+            self._data[idx] = row_data(key, items[idx][1])
+            self._disabled[idx] = items[idx][1]['disabled']
+            self.dataChanged.emit(self.index(idx, 0),
+                                  self.index(idx, self.columnCount() - 1))
 
 
 class HypersetTable(QtWidgets.QTableView):
@@ -435,9 +445,9 @@ class HypersetTable(QtWidgets.QTableView):
 
     def selectionChanged(self, selected, deselected):
         super(HypersetTable, self).selectionChanged(selected, deselected)
-        self._selected_keys = [self._model.get_key(row)
-                               for row in set(index.row()
-                                              for index in selected.indexes())]
+        self._selected_keys = [
+            self._model.get_key(row)
+            for row in set(index.row() for index in self.selectedIndexes())]
         self._disable_set_action.setChecked(
             self._state.hypersets[self._selected_keys[0]]['disabled']
             if self._selected_keys else False)
@@ -450,6 +460,8 @@ class HypersetTable(QtWidgets.QTableView):
     def _handle_disable_set(self, checked):
         for key in self._selected_keys:
             self._state.disable_hyperset(key, checked)
+        self.clearSelection()
+        self._selected_keys = []
 
     def _handle_plot_loss(self):
         COLORS = 'cmykrgb'
@@ -535,9 +547,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if initial_session is not None:
             self._state.set_session_path(initial_session)
         else:
-            self._handle_state_updated()
+            self._handle_state_updated(None)
 
-    def _handle_state_updated(self):
+    def _handle_state_updated(self, _):
         have_session = self._state.session_path is not None
         self._sets_menu.setEnabled(have_session)
         self._handle_selection_updated()
