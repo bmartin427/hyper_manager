@@ -498,6 +498,7 @@ class HypersetTable(QtWidgets.QTableView):
                         color=color, linestyle='--')
             plots += 1
         if plots:
+            pyplot.grid()
             pyplot.legend()
             pyplot.show()
 
