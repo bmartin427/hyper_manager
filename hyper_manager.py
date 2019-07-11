@@ -73,12 +73,15 @@ def _get_loss_stats(full_log):
 
     min_loss = numpy.amin(full_log[:, 1])
     cur_loss = full_log[-1, 1]
-    # Do a linear fit, but weight the later terms more aggressively than the
-    # earlier ones.
-    W = numpy.sqrt((numpy.arange(full_log.shape[0]) + 1)[:, numpy.newaxis])
-    A = W * numpy.hstack([full_log[:, 0:1],
-                          numpy.ones((full_log.shape[0], 1))])
-    B = W * full_log[:, 1:2]
+    # Do a linear fit to the latter half of the log data, and weight the later
+    # terms more aggressively than the earlier ones.
+    #
+    # Per https://en.wikipedia.org/wiki/Weighted_least_squares the weight
+    # matrix we should use is actually the square root of the desired weights.
+    data = full_log[full_log.shape[0] // 2:, :]
+    W = numpy.sqrt((numpy.arange(data.shape[0]) + 1)[:, numpy.newaxis])
+    A = W * numpy.hstack([data[:, 0:1], numpy.ones((data.shape[0], 1))])
+    B = W * data[:, 1:2]
     p, _, _, _ = numpy.linalg.lstsq(A, B, rcond=None)
     loss_rate = p[0][0] * 60.  # Per minute not per second.
     loss_intercept = p[1][0]
@@ -190,6 +193,11 @@ class ManagerState(QtCore.QObject):
         return _parse_logs(
             os.path.join(self._session_path, key, project_paths.LOGS_DIR))
 
+    def refresh_loss_stats(self, key):
+        self._update_loss_stats(key)
+        self._write_set_data(key)
+        self.updated_signal.emit(key)
+
     # QObject override
     def timerEvent(self, _):
         if not self.running:
@@ -283,11 +291,7 @@ class ManagerState(QtCore.QObject):
             self._subprocess_log.close()
             self._subprocess = None
             running_set['this_run_s'] = None
-            # (Discard the intercept.)
-            for k, v in zip(
-                    ['min_test_loss', 'cur_test_loss', 'test_loss_rate'],
-                    _get_loss_stats(self.get_loss_history(running_set_key))):
-                running_set[k] = v
+            self._update_loss_stats(running_set_key)
             self._running_set_key = None
             self._last_time = None
 
@@ -310,6 +314,16 @@ class ManagerState(QtCore.QObject):
             return None
         checkpoints.sort()
         return os.path.relpath(checkpoints[-1], start=set_dir)
+
+    def _update_loss_stats(self, key):
+        # NOTE: It is necessary to rewrite the key state and issue an update
+        # signal following this method.
+        assert key in self._hypersets
+        # (Discard the intercept.)
+        for k, v in zip(
+                ['min_test_loss', 'cur_test_loss', 'test_loss_rate'],
+                _get_loss_stats(self.get_loss_history(key))):
+            self._hypersets[key][k] = v
 
 
 class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
@@ -432,6 +446,8 @@ class HypersetTable(QtWidgets.QTableView):
         self._disable_set_action.setCheckable(True)
         self._plot_loss_action = add_action(
             'Plot validation loss(es)', self._handle_plot_loss)
+        self._reset_stats_action = add_action(
+            'Refresh loss statistics', self._handle_refresh_stats)
 
         self._selected_keys = []
 
@@ -484,6 +500,10 @@ class HypersetTable(QtWidgets.QTableView):
         if plots:
             pyplot.legend()
             pyplot.show()
+
+    def _handle_refresh_stats(self):
+        for key in (self._selected_keys or self._state.hypersets.keys()):
+            self._state.refresh_loss_stats(key)
 
 
 class MainWidget(QtWidgets.QSplitter):
@@ -578,8 +598,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _handle_selection_updated(self):
         have_selection = bool(self._widget.table.selected_keys)
         for my_action, table_action in self._set_actions:
-            my_action.setEnabled(have_selection)
-            my_action.setChecked(table_action.isChecked())
+            # This is a little hacky.  We want the 'disable' to be grayed out
+            # with no selection, but every other action defaults to operating
+            # on every entry if there is no selection.
+            if table_action.isCheckable():
+                my_action.setEnabled(have_selection)
+                my_action.setChecked(table_action.isChecked())
 
     def _handle_new_session(self):
         dialog = QtWidgets.QFileDialog(
