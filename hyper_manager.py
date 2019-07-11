@@ -445,16 +445,16 @@ class HypersetTable(QtWidgets.QTableView):
 
     def _handle_model_reset(self):
         self.clearSelection()
-        self._selected_keys = None
+        self._selected_keys = []
 
     def _handle_disable_set(self, checked):
-        for key in self.selected_keys:
+        for key in self._selected_keys:
             self._state.disable_hyperset(key, checked)
 
     def _handle_plot_loss(self):
         COLORS = 'cmykrgb'
         plots = 0
-        for key in (self.selected_keys or self._state.hypersets.keys()):
+        for key in (self._selected_keys or self._state.hypersets.keys()):
             data = self._state.get_loss_history(key)
             if data is None:
                 continue
