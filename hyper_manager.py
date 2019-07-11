@@ -2,6 +2,7 @@
 # Copyright 2019 Brad Martin.  All rights reserved.
 
 import datetime
+import functools
 import glob
 import hashlib
 import json
@@ -338,6 +339,10 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
         state.updated_signal.connect(self._handle_state_changed)
         self._data = []
         self._disabled = []
+        self._sort_column = 0
+        self._sort_order = QtCore.Qt.DescendingOrder
+        self._sorted_keys = []
+
         self._handle_state_changed(None)
 
     # QAbstractTableModel interface implementation
@@ -378,6 +383,11 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
 
         return None
 
+    def sort(self, column, order=QtCore.Qt.AscendingOrder):
+        self._sort_column = column
+        self._sort_order = order
+        self._handle_state_changed(None)
+
     # Other methods
     def get_key(self, row_index):
         return self._data[row_index][self._KEY_COL]
@@ -398,19 +408,35 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
                 k,
             ]
 
-        # TODO sort
-        items = list(self._state.hypersets.items())
-        if (key is None) or (key not in self._state.hypersets):
+        sorted_keys = self._get_sorted_keys()
+        if (key is None) or \
+           (key not in self._state.hypersets) or \
+           (sorted_keys != self._sorted_keys):
             self.beginResetModel()
-            self._data = [row_data(k, d) for k, d in items]
-            self._disabled = [d['disabled'] for _, d in items]
+            self._sorted_keys = sorted_keys
+            self._data = [row_data(k, self._state.hypersets[k])
+                          for k in self._sorted_keys]
+            self._disabled = [self._state.hypersets[k]['disabled']
+                              for k in self._sorted_keys]
             self.endResetModel()
         else:
-            idx = [i for i, x in enumerate(items) if x[0] == key][0]
-            self._data[idx] = row_data(key, items[idx][1])
-            self._disabled[idx] = items[idx][1]['disabled']
+            idx = sorted_keys.index(key)
+            self._data[idx] = row_data(key, self._state.hypersets[key])
+            self._disabled[idx] = self._state.hypersets[key]['disabled']
             self.dataChanged.emit(self.index(idx, 0),
                                   self.index(idx, self.columnCount() - 1))
+
+    def _get_sorted_keys(self):
+        def key_on_field(f, k):
+            ret = self._state.hypersets[k][f]
+            return ret if ret is not None else -1.
+
+        key = ([functools.partial(key_on_field, f) for f in
+                ['args', 'this_run_s', 'total_training_s', 'min_test_loss',
+                 'cur_test_loss', 'test_loss_rate']] +
+               [None])[self._sort_column]
+        return sorted(self._state.hypersets.keys(), key=key,
+                      reverse=(self._sort_order == QtCore.Qt.DescendingOrder))
 
 
 class HypersetTable(QtWidgets.QTableView):
@@ -421,19 +447,6 @@ class HypersetTable(QtWidgets.QTableView):
         self._state = state
         self._model = ManagerStateTableAdapter(self, state)
         self._model.modelAboutToBeReset.connect(self._handle_model_reset)
-
-        hz = self.horizontalHeader()
-        vt = self.verticalHeader()
-        hz.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        vt.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        hz.setStretchLastSection(True)
-        # TODO self.setSortingEnabled(True)
-        self.setSizeAdjustPolicy(
-            QtWidgets.QAbstractScrollArea.AdjustToContentsOnFirstShow)
-        self.setMinimumHeight(8 * self.fontMetrics().lineSpacing())
-        self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.setContextMenuPolicy(QtCore.Qt.ActionsContextMenu)
 
         def add_action(label, handler):
             action = QtWidgets.QAction(label)
@@ -451,9 +464,23 @@ class HypersetTable(QtWidgets.QTableView):
 
         self._selected_keys = []
 
-        # This call seems to start invoking slots which may look for data that
-        # doesn't exist yet if it doesn't come last.
+        # Calls on self seem to start invoking slots which may look for data
+        # that doesn't exist yet if they don't come after all variable
+        # initialization in the constructor.
         self.setModel(self._model)
+        hz = self.horizontalHeader()
+        vt = self.verticalHeader()
+        hz.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        vt.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        hz.setStretchLastSection(True)
+        self.setSortingEnabled(True)
+        self.setSizeAdjustPolicy(
+            QtWidgets.QAbstractScrollArea.AdjustToContentsOnFirstShow)
+        self.setMinimumHeight(8 * self.fontMetrics().lineSpacing())
+        self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.setContextMenuPolicy(QtCore.Qt.ActionsContextMenu)
+        self.sortByColumn(3, QtCore.Qt.AscendingOrder)
 
     @property
     def selected_keys(self):
