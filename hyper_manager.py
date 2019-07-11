@@ -30,9 +30,13 @@ _CMDLINE = [os.path.join(_ROOT_DIR, 'training.py'),
 def _parse_logs(logs_dir):
     """Reads a tensorboard log directory.
 
-    Returns an Nx2 numpy array, where the first column is the amount of
-    training time, and the second column is the validation loss, for each of
-    the N logged events in the log.
+    Returns an Nx5 numpy array, where N is the number of logged events in the
+    log, and the 5 columns are:
+     * The amount of training time when the event was logged,
+     * The training loss,
+     * The validation loss,
+     * The training error (excluding regularization penalties),
+     * The validation error (excluding regularization penalties).
     """
     rel_time = 0.
     full_log = None
@@ -40,60 +44,89 @@ def _parse_logs(logs_dir):
         for subdir in sorted(os.listdir(logs_dir)):
             acc = EventAccumulator(os.path.join(logs_dir, subdir))
             acc.Reload()
+
             try:
-                loss = acc.Scalars('epoch_val_loss')
+                train_loss = acc.Scalars('epoch_loss')
+                val_loss = acc.Scalars('epoch_val_loss')
             except KeyError:
                 continue
-            if not loss:
+            if not train_loss or not val_loss:
                 continue
+
+            try:
+                train_error = acc.Scalars('epoch_masked_mse')
+                val_error = acc.Scalars('epoch_val_masked_mse')
+            except KeyError:
+                # Some files might not log this separately.  In that case
+                # assume the loss is the error metric.
+                train_error, val_error = train_loss, val_loss
+
             this_log = numpy.array([
-                (l.wall_time - loss[0].wall_time + rel_time, l.value)
-                for l in loss])
+                (tl.wall_time - train_loss[0].wall_time + rel_time,
+                 tl.value, vl.value, te.value, ve.value)
+                for tl, vl, te, ve in zip(
+                        train_loss, val_loss, train_error, val_error)])
             if full_log is None:
                 full_log = this_log
             else:
                 full_log = numpy.concatenate((full_log, this_log))
-            rel_time += loss[-1].wall_time - loss[0].wall_time
+            rel_time += train_loss[-1].wall_time - train_loss[0].wall_time
     except FileNotFoundError:
         pass
     return full_log
 
 
-def _get_loss_stats(full_log):
+def _get_stats(full_log):
     """Given the result of _parse_logs(), returns a tuple of four elements:
-     * Minimum validation loss in the log.
-     * Validation loss at the end of the log.
-     * The rate at which the validation loss was changing towards the end of
+     * Minimum validation error in the log.
+     * Validation error at the end of the log.
+     * Bias (defined as 1 - training_error / validation_error) at the end of
+       the log.
+     * The rate at which the validation error was changing towards the end of
        the log, per minute of training time.
-     * The intercept of the linear fit used to estimate the loss rate.
+     * The intercept of the linear fit used to estimate the error rate.
 
-    Returns four Nones if there is no input log data.
+    Returns a tuple of Nones if there is no input log data.
     """
     if full_log is None:
-        return None, None, None, None
+        return None, None, None, None, None
 
-    min_loss = numpy.amin(full_log[:, 1])
-    cur_loss = full_log[-1, 1]
+    min_error = numpy.amin(full_log[:, 4])
+    cur_error = full_log[-1, 4]
+    cur_bias = 1. - full_log[-1, 3] / full_log[-1, 4]
     # Do a linear fit to the latter half of the log data, and weight the later
     # terms more aggressively than the earlier ones.
     #
     # Per https://en.wikipedia.org/wiki/Weighted_least_squares the weight
     # matrix we should use is actually the square root of the desired weights.
-    data = full_log[full_log.shape[0] // 2:, :]
+    start_idx = full_log.shape[0] // 2
+    data = full_log[start_idx:, :]
     W = numpy.sqrt((numpy.arange(data.shape[0]) + 1)[:, numpy.newaxis])
     A = W * numpy.hstack([data[:, 0:1], numpy.ones((data.shape[0], 1))])
-    B = W * data[:, 1:2]
+    B = W * data[:, 4:5]
     p, _, _, _ = numpy.linalg.lstsq(A, B, rcond=None)
-    loss_rate = p[0][0] * 60.  # Per minute not per second.
-    loss_intercept = p[1][0]
+    error_rate = p[0][0] * 60.  # Per minute not per second.
+    error_intercept = p[1][0]
 
-    return min_loss, cur_loss, loss_rate, loss_intercept
+    return (min_error,
+            cur_error, cur_bias,
+            error_rate, error_intercept)
 
 
 class ManagerState(QtCore.QObject):
     _HYPERSET_FILE = 'hyperset.json'
     _LOG_FILE = 'training.log'
     _OVERWRITTEN_LINE_RE = re.compile('[^\r\n]*\r')
+    _DEFAULT_DATA = {
+        'args': '',
+        'disabled': False,
+        'this_run_s': None,
+        'total_training_s': 0.,
+        'min_test_loss': None,
+        'cur_test_loss': None,
+        'test_loss_rate': None,
+        'cur_bias': None,
+    }
 
     # The key of a previously-existing hyperset that was updated is passed
     # through the signal.  If None, the entire table should be treated as
@@ -151,16 +184,8 @@ class ManagerState(QtCore.QObject):
             raise ValueError(
                 'A hyperparam set with arguments %r already exists!' %
                 set_args)
-        data = {
-            'args': set_args,
-            'disabled': False,
-            'this_run_s': None,
-            'total_training_s': 0.,
-            'min_test_loss': None,
-            'cur_test_loss': None,
-            'test_loss_rate': None,
-        }
-        self._hypersets[key] = data
+        self._hypersets[key] = dict(self._DEFAULT_DATA)
+        self._hypersets[key]['args'] = set_args
         os.mkdir(os.path.join(self._session_path, key))
         self._write_set_data(key)
         # key didn't previously exist, so reset everything.
@@ -190,12 +215,12 @@ class ManagerState(QtCore.QObject):
         assert self._running_set_key is None
         self._console_text = 'Not running'
 
-    def get_loss_history(self, key):
+    def get_history(self, key):
         return _parse_logs(
             os.path.join(self._session_path, key, project_paths.LOGS_DIR))
 
-    def refresh_loss_stats(self, key):
-        self._update_loss_stats(key)
+    def refresh_stats(self, key):
+        self._update_stats(key)
         self._write_set_data(key)
         self.updated_signal.emit(key)
 
@@ -243,7 +268,13 @@ class ManagerState(QtCore.QObject):
         # Even if the data was saved while running, we shouldn't indicate that
         # run status now.
         data['this_run_s'] = None
-        self._hypersets[key] = data
+        # Start with the default data and then selectively update it with the
+        # loaded state, to ensure that we have exactly the fields we expect in
+        # the state going forward, even if the stored file used an old schema.
+        self._hypersets[key] = dict(self._DEFAULT_DATA)
+        for k in self._hypersets[key].keys():
+            if k in data:
+                self._hypersets[key][k] = data[k]
 
     def _write_set_data(self, key):
         set_fn = os.path.join(self._session_path, key, self._HYPERSET_FILE)
@@ -292,7 +323,7 @@ class ManagerState(QtCore.QObject):
             self._subprocess_log.close()
             self._subprocess = None
             running_set['this_run_s'] = None
-            self._update_loss_stats(running_set_key)
+            self._update_stats(running_set_key)
             self._running_set_key = None
             self._last_time = None
 
@@ -316,20 +347,22 @@ class ManagerState(QtCore.QObject):
         checkpoints.sort()
         return os.path.relpath(checkpoints[-1], start=set_dir)
 
-    def _update_loss_stats(self, key):
+    def _update_stats(self, key):
         # NOTE: It is necessary to rewrite the key state and issue an update
         # signal following this method.
         assert key in self._hypersets
-        # (Discard the intercept.)
+        # (Discard the intercepts.)
         for k, v in zip(
-                ['min_test_loss', 'cur_test_loss', 'test_loss_rate'],
-                _get_loss_stats(self.get_loss_history(key))):
+                ['min_test_loss', 'cur_test_loss', 'cur_bias',
+                 'test_loss_rate'],
+                _get_stats(self.get_history(key))):
             self._hypersets[key][k] = v
 
 
 class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
     _HEADERS = ['Args', 'This Run', 'Total Training',
-                'Min Test Loss', 'Cur Test Loss', 'Loss Rate', 'Key']
+                'Min Test Error', 'Cur Test Error', 'Error Rate',
+                'Cur Bias', 'Key']
     _KEY_COL = _HEADERS.index('Key')
 
     def __init__(self, parent, state):
@@ -405,6 +438,7 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
                 fmt_float(d['min_test_loss']),
                 fmt_float(d['cur_test_loss']),
                 fmt_float(d['test_loss_rate']),
+                fmt_float(d['cur_bias']),
                 k,
             ]
 
@@ -433,7 +467,7 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
 
         key = ([functools.partial(key_on_field, f) for f in
                 ['args', 'this_run_s', 'total_training_s', 'min_test_loss',
-                 'cur_test_loss', 'test_loss_rate']] +
+                 'cur_test_loss', 'test_loss_rate', 'cur_bias']] +
                [None])[self._sort_column]
         return sorted(self._state.hypersets.keys(), key=key,
                       reverse=(self._sort_order == QtCore.Qt.DescendingOrder))
@@ -457,10 +491,10 @@ class HypersetTable(QtWidgets.QTableView):
         self._disable_set_action = add_action(
             'Disable set(s) from running', self._handle_disable_set)
         self._disable_set_action.setCheckable(True)
-        self._plot_loss_action = add_action(
-            'Plot validation loss(es)', self._handle_plot_loss)
+        self._plot_error_action = add_action(
+            'Plot validation error', self._handle_plot_error)
         self._reset_stats_action = add_action(
-            'Refresh loss statistics', self._handle_refresh_stats)
+            'Refresh error statistics', self._handle_refresh_stats)
 
         self._selected_keys = []
 
@@ -506,18 +540,18 @@ class HypersetTable(QtWidgets.QTableView):
         self.clearSelection()
         self._selected_keys = []
 
-    def _handle_plot_loss(self):
+    def _handle_plot_error(self):
         COLORS = 'cmykrgb'
         plots = 0
         for key in (self._selected_keys or self._state.hypersets.keys()):
-            data = self._state.get_loss_history(key)
+            data = self._state.get_history(key)
             if data is None:
                 continue
-            _, _, rate, intercept = _get_loss_stats(data)
+            _, _, _, rate, intercept = _get_stats(data)
             if not plots:
                 pyplot.figure()
             color = COLORS[plots % len(COLORS)]
-            pyplot.plot(data[:, 0], data[:, 1], color=color,
+            pyplot.plot(data[:, 0], data[:, 4], color=color,
                         label=self._state.hypersets[key]['args'])
             pyplot.plot((data[0, 0], data[-1, 0]),
                         (intercept + rate * data[0, 0] / 60.,
@@ -531,7 +565,7 @@ class HypersetTable(QtWidgets.QTableView):
 
     def _handle_refresh_stats(self):
         for key in (self._selected_keys or self._state.hypersets.keys()):
-            self._state.refresh_loss_stats(key)
+            self._state.refresh_stats(key)
 
 
 class MainWidget(QtWidgets.QSplitter):
