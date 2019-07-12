@@ -575,12 +575,12 @@ class HypersetTable(QtWidgets.QTableView):
             color = COLORS[i % len(COLORS)]
             pyplot.plot(data[:, 0] / S_H, data[:, 4], color=color,
                         label=self._state.hypersets[key]['args'])
-            pyplot.plot((data[0, 0] / S_H, data[-1, 0] / S_H),
-                        (intercept + rate * data[0, 0] / M_H,
-                         intercept + rate * data[-1, 0] / M_H),
+            pyplot.plot(data[:, 0] / S_H,
+                        intercept + rate * data[:, 0] / M_H,
                         color=color, linestyle='--')
         pyplot.title('Error')
         pyplot.xlabel('Time (h)')
+        pyplot.yscale('log')
         pyplot.grid()
         pyplot.legend()
 
@@ -591,6 +591,7 @@ class HypersetTable(QtWidgets.QTableView):
                         label=self._state.hypersets[key]['args'])
         pyplot.title('Bias')
         pyplot.xlabel('Time (h)')
+        pyplot.ylim(-0.1, 1.1)
         pyplot.grid()
         pyplot.legend()
 
