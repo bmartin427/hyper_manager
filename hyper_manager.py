@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2019 Brad Martin.  All rights reserved.
 
+import collections
 import datetime
 import functools
 import glob
@@ -76,6 +77,16 @@ def _parse_logs(logs_dir):
     return full_log
 
 
+def _get_bias(log_data):
+    """Calculate bias.
+
+    Returns the bias for each row of data provided with columns as per the
+    result of _parse_logs().  Bias is defined here as 1 - training_error /
+    validation_error.
+    """
+    return 1. - log_data[:, 3] / log_data[:, 4]
+
+
 def _get_stats(full_log):
     """Given the result of _parse_logs(), returns a tuple of four elements:
      * Minimum validation error in the log.
@@ -93,7 +104,7 @@ def _get_stats(full_log):
 
     min_error = numpy.amin(full_log[:, 4])
     cur_error = full_log[-1, 4]
-    cur_bias = 1. - full_log[-1, 3] / full_log[-1, 4]
+    cur_bias = _get_bias(full_log[-1:, :])[0]
     # Do a linear fit to the latter half of the log data, and weight the later
     # terms more aggressively than the earlier ones.
     #
@@ -545,26 +556,45 @@ class HypersetTable(QtWidgets.QTableView):
 
     def _handle_plot_error(self):
         COLORS = 'cmykrgb'
-        plots = 0
-        for key in (self._selected_keys or self._state.hypersets.keys()):
-            data = self._state.get_history(key)
-            if data is None:
-                continue
+        S_H = 3600.  # seconds per hour
+        M_H = 60.  # minutes per hour
+
+        keys = self._selected_keys or self._state.hypersets.keys()
+        all_data = collections.OrderedDict()
+        for k in keys:
+            d = self._state.get_history(k)
+            if d is not None:
+                all_data[k] = d
+        if not all_data:
+            return
+
+        pyplot.figure()
+        pyplot.subplot(2, 1, 1)
+        for i, (key, data) in enumerate(all_data.items()):
             _, _, _, rate, intercept = _get_stats(data)
-            if not plots:
-                pyplot.figure()
-            color = COLORS[plots % len(COLORS)]
-            pyplot.plot(data[:, 0], data[:, 4], color=color,
+            color = COLORS[i % len(COLORS)]
+            pyplot.plot(data[:, 0] / S_H, data[:, 4], color=color,
                         label=self._state.hypersets[key]['args'])
-            pyplot.plot((data[0, 0], data[-1, 0]),
-                        (intercept + rate * data[0, 0] / 60.,
-                         intercept + rate * data[-1, 0] / 60.),
+            pyplot.plot((data[0, 0] / S_H, data[-1, 0] / S_H),
+                        (intercept + rate * data[0, 0] / M_H,
+                         intercept + rate * data[-1, 0] / M_H),
                         color=color, linestyle='--')
-            plots += 1
-        if plots:
-            pyplot.grid()
-            pyplot.legend()
-            pyplot.show()
+        pyplot.title('Error')
+        pyplot.xlabel('Time (h)')
+        pyplot.grid()
+        pyplot.legend()
+
+        pyplot.subplot(2, 1, 2)
+        for i, (key, data) in enumerate(all_data.items()):
+            color = COLORS[i % len(COLORS)]
+            pyplot.plot(data[:, 0] / S_H, _get_bias(data), color=color,
+                        label=self._state.hypersets[key]['args'])
+        pyplot.title('Bias')
+        pyplot.xlabel('Time (h)')
+        pyplot.grid()
+        pyplot.legend()
+
+        pyplot.show()
 
     def _handle_refresh_stats(self):
         for key in (self._selected_keys or self._state.hypersets.keys()):
