@@ -195,6 +195,9 @@ class ManagerState(QtCore.QObject):
         self._hypersets[key]['disabled'] = disabled
         self._write_set_data(key)
         self.updated_signal.emit(key)
+        if self._running_set_key == key:
+            self.stop_session()
+            self.run_session()
 
     def run_session(self):
         assert not self.running
