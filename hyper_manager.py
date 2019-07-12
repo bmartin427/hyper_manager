@@ -610,9 +610,11 @@ class MainWidget(QtWidgets.QSplitter):
         self.table = HypersetTable(self, state)
         self.addWidget(self.table)
 
+        font = QtGui.QFont('Courier', 10)
         self.text = QtWidgets.QTextEdit(self)
         self.text.setReadOnly(True)
         self.text.setEnabled(False)
+        self.text.setCurrentFont(font)
         self.text.setMinimumHeight(4 * self.text.fontMetrics().lineSpacing())
         self.text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.addWidget(self.text)
@@ -677,8 +679,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._widget.text.setEnabled(running)
         self._widget.text.setPlainText(self._state.console_text)
-        self._widget.text.moveCursor(QtGui.QTextCursor.End)
-        self._widget.text.ensureCursorVisible()
+        scroll = self._widget.text.verticalScrollBar()
+        scroll.setValue(scroll.maximum())
 
         if have_session:
             session = os.path.basename(self._state.session_path)
