@@ -667,6 +667,12 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._handle_state_updated(None)
 
+    # QMainWindow override
+    def closeEvent(self, event):
+        if self._state.running:
+            self._state.stop_session()
+        super(MainWindow, self).closeEvent(event)
+
     def _handle_state_updated(self, _):
         have_session = self._state.session_path is not None
         self._sets_menu.setEnabled(have_session)
