@@ -98,6 +98,8 @@ def _filter_log(full_log):
     in the same form, where all columns have had a moving-average filter
     applied which is approximately 5 minutes of training time wide.
     """
+    if full_log is None:
+        return None
     total_m = (full_log[-1, 0] - full_log[0, 0]) / _S_M
     samples_per_m = full_log.shape[0] / total_m
     filter_width = int(round(5. * samples_per_m))
@@ -185,12 +187,8 @@ class ManagerState(QtCore.QObject):
         self._subprocess_log = None
         self._last_time = None
         self._console_text = ''
-
-    def _reset(self):
-        if self.running:
-            self.stop_session()
-        self._session_path = None
-        self._hypersets = {}
+        # NOTE: Bias threshold value is not saved in the session currently.
+        self._bias_threshold = None
 
     @property
     def session_path(self):
@@ -208,9 +206,16 @@ class ManagerState(QtCore.QObject):
     def console_text(self):
         return self._console_text
 
+    @property
+    def bias_threshold(self):
+        return self._bias_threshold
+
     def set_session_path(self, path):
         assert os.path.exists(path)
-        self._reset()
+        if self.running:
+            self.stop_session()
+        self._hypersets = {}
+
         self._session_path = path
         for setfile in glob.glob(os.path.join(path, '*', self._HYPERSET_FILE)):
             self._load_hyperset(setfile)
@@ -268,6 +273,10 @@ class ManagerState(QtCore.QObject):
         self._update_stats(key)
         self._write_set_data(key)
         self.updated_signal.emit(key)
+
+    def set_bias_threshold(self, val):
+        self._bias_threshold = val
+        self.updated_signal.emit(None)
 
     # QObject override
     def timerEvent(self, _):
@@ -397,10 +406,29 @@ class ManagerState(QtCore.QObject):
         # signal following this method.
         assert key in self._hypersets
         # (Discard the intercepts.)
-        for k, v in zip(
-                ['min_test_loss', 'cur_test_loss', 'cur_bias',
-                 'test_loss_rate'],
-                _get_stats(self.get_history(key))):
+        full_log = self.get_history(key)
+        filtered = _filter_log(full_log)
+        if self._bias_threshold is not None:
+            bias = _get_bias(filtered)
+            mask = bias > self._bias_threshold
+            filtered_idx = numpy.argmax(mask)
+            if mask[filtered_idx]:
+                # First disable the set.
+                self.disable_hyperset(key, True)
+                # Truncate full_log by the detected amount.  We'll leave the
+                # filtered log alone, since the 'current' stats should not be
+                # thresholded.
+                #
+                # Remember that the two arrays don't have the same number of
+                # rows, so we need to match by time instead.
+                exceeded_t = filtered[filtered_idx][0]
+                full_idx = numpy.argmax(full_log[:, 0] >= exceeded_t)
+                if full_idx:
+                    full_log = full_log[:full_idx]
+
+        for k, v in zip(['min_test_loss', 'cur_test_loss', 'cur_bias',
+                         'test_loss_rate'],
+                        _get_stats(full_log, filtered=filtered)):
             self._hypersets[key][k] = v
 
 
@@ -679,6 +707,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sets_menu = self._menu.addMenu('Sets')
         self._sets_menu.addAction(
             'Add hyperparam set...', self._handle_add_set)
+        self._bias_threshold_action = self._sets_menu.addAction(
+            'Bias threshold...', self._handle_bias_threshold)
+        self._bias_threshold_action.setCheckable(True)
+        self._sets_menu.addSeparator()
         self._set_actions = []
         for table_action in self._widget.table.actions():
             action = QtWidgets.QAction(table_action.text())
@@ -709,6 +741,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _handle_state_updated(self, _):
         have_session = self._state.session_path is not None
         self._sets_menu.setEnabled(have_session)
+        self._bias_threshold_action.setChecked(
+            self._state.bias_threshold is not None)
         self._handle_selection_updated()
 
         self._run_menu.setEnabled(have_session)
@@ -723,6 +757,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if have_session:
             session = os.path.basename(self._state.session_path)
+            if not session:
+                session = os.path.dirname(self._state.session_path)
             if self._state.hypersets:
                 status = 'Session %s: %s' % (
                     'running' if running else 'stopped', session)
@@ -772,6 +808,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._state.add_hyperset(set_args)
             except ValueError as e:
                 QtWidgets.QMessageBox.warning(self, 'Set exists', str(e))
+
+    def _handle_bias_threshold(self):
+        # This is called after the checked state has already changed.
+        if not self._bias_threshold_action.isChecked():
+            self._state.set_bias_threshold(None)
+            return
+
+        val, ok = QtWidgets.QInputDialog.getDouble(
+            self, 'Apply Bias Threshold',
+            'Disables running hypersets when the \'current bias\' stat '
+            'exceeds this value.  Also, the \'min error\' stat will apply to '
+            'only that part of the log before this threshold is exceeded '
+            '(requires refresh).',
+            0.5, 0., 1., 2)
+        if ok:
+            self._state.set_bias_threshold(val)
 
     def _handle_run_session(self):
         self._state.run_session()
