@@ -27,6 +27,10 @@ _CMDLINE = [os.path.join(_ROOT_DIR, 'training.py'),
             '--dataset', os.path.join(_ROOT_DIR, 'dataset.npz'),
             '--intervals', '6']
 
+_M_H = 60.  # minutes per hour
+_S_M = 60.  # seconds per minute
+_S_H = _S_M * _M_H  # seconds per hour
+
 
 def _parse_logs(logs_dir):
     """Reads a tensorboard log directory.
@@ -87,8 +91,30 @@ def _get_bias(log_data):
     return 1. - log_data[:, 3] / log_data[:, 4]
 
 
-def _get_stats(full_log):
-    """Given the result of _parse_logs(), returns a tuple of four elements:
+def _filter_log(full_log):
+    """Applies a moving-average filter on the given log data.
+
+    Given input in the same form as the output of _parse_logs, returns output
+    in the same form, where all columns have had a moving-average filter
+    applied which is approximately 5 minutes of training time wide.
+    """
+    total_m = (full_log[-1, 0] - full_log[0, 0]) / _S_M
+    samples_per_m = full_log.shape[0] / total_m
+    filter_width = int(round(5. * samples_per_m))
+    filtered = numpy.stack(
+        [numpy.convolve(
+            full_log[:, i], numpy.ones(filter_width) / filter_width,
+            mode='valid')
+         for i in range(full_log.shape[1])],
+        axis=1)
+    return filtered
+
+
+def _get_stats(full_log, filtered=None):
+    """Gets log error stats.
+
+    Given the results of _parse_logs() and _filter_log() respectively, returns
+    a tuple of four elements:
      * Minimum validation error in the log.
      * Validation error at the end of the log.
      * Bias (defined as 1 - training_error / validation_error) at the end of
@@ -98,13 +124,18 @@ def _get_stats(full_log):
      * The intercept of the linear fit used to estimate the error rate.
 
     Returns a tuple of Nones if there is no input log data.
+
+    If the filtered output is not provided, it is implicitly computed from
+    full_log.
     """
     if full_log is None:
         return None, None, None, None, None
+    if filtered is None:
+        filtered = _filter_log(full_log)
 
     min_error = numpy.amin(full_log[:, 4])
-    cur_error = full_log[-1, 4]
-    cur_bias = _get_bias(full_log[-1:, :])[0]
+    cur_error = filtered[-1, 4]
+    cur_bias = _get_bias(filtered[-1:, :])[0]
     # Do a linear fit to the latter half of the log data, and weight the later
     # terms more aggressively than the earlier ones.
     #
@@ -556,27 +587,27 @@ class HypersetTable(QtWidgets.QTableView):
 
     def _handle_plot_error(self):
         COLORS = 'cmykrgb'
-        S_H = 3600.  # seconds per hour
-        M_H = 60.  # minutes per hour
 
         keys = self._selected_keys or self._state.hypersets.keys()
         all_data = collections.OrderedDict()
         for k in keys:
             d = self._state.get_history(k)
             if d is not None:
-                all_data[k] = d
+                all_data[k] = (d, _filter_log(d))
         if not all_data:
             return
 
         pyplot.figure()
         pyplot.subplot(2, 1, 1)
-        for i, (key, data) in enumerate(all_data.items()):
-            _, _, _, rate, intercept = _get_stats(data)
+        for i, (key, (data, filtered)) in enumerate(all_data.items()):
+            _, _, _, rate, intercept = _get_stats(data, filtered=filtered)
             color = COLORS[i % len(COLORS)]
-            pyplot.plot(data[:, 0] / S_H, data[:, 4], color=color,
+            pyplot.plot(data[:, 0] / _S_H, data[:, 4], color=color,
+                        marker='.', linestyle='', markersize=1)
+            pyplot.plot(filtered[:, 0] / _S_H, filtered[:, 4], color=color,
                         label=self._state.hypersets[key]['args'])
-            pyplot.plot(data[:, 0] / S_H,
-                        intercept + rate * data[:, 0] / M_H,
+            pyplot.plot(data[:, 0] / _S_H,
+                        intercept + rate * data[:, 0] / _M_H,
                         color=color, linestyle='--')
         pyplot.title('Error')
         pyplot.xlabel('Time (h)')
@@ -585,10 +616,12 @@ class HypersetTable(QtWidgets.QTableView):
         pyplot.legend()
 
         pyplot.subplot(2, 1, 2)
-        for i, (key, data) in enumerate(all_data.items()):
+        for i, (key, (data, filtered)) in enumerate(all_data.items()):
             color = COLORS[i % len(COLORS)]
-            pyplot.plot(data[:, 0] / S_H, _get_bias(data), color=color,
-                        label=self._state.hypersets[key]['args'])
+            pyplot.plot(data[:, 0] / _S_H, _get_bias(data), color=color,
+                        marker='.', linestyle='', markersize=1)
+            pyplot.plot(filtered[:, 0] / _S_H, _get_bias(filtered),
+                        color=color, label=self._state.hypersets[key]['args'])
         pyplot.title('Bias')
         pyplot.xlabel('Time (h)')
         pyplot.ylim(-0.1, 1.1)
