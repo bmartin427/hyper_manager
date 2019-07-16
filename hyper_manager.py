@@ -172,6 +172,25 @@ class ManagerState(QtCore.QObject):
         'cur_bias': None,
     }
 
+    class Priority:
+        COUNT = 4
+        NONE, TIME, RATE, TTZ = range(COUNT)
+        PRETTY = {
+            # No prioritization: equal weighting.
+            NONE: 'None',
+            # Prioritize sets that have less training time over those that
+            # have more.
+            TIME: 'Training Time',
+            # Prioritize sets where the error is estimated to be decreasing
+            # faster.
+            RATE: 'Error Rate',
+            # Prioritize sets that would be expected to reach zero error
+            # sooner, if the current error rate estimate held indefinitely.
+            # Obviously this won't happen, but this does give an effective
+            # blend between prioritizing error rate, and prioritizing sets
+            # that already have a relatively low error.
+            TTZ: '"Time to Zero"'}
+
     # The key of a previously-existing hyperset that was updated is passed
     # through the signal.  If None, the entire table should be treated as
     # changed.
@@ -187,6 +206,7 @@ class ManagerState(QtCore.QObject):
         self._subprocess_log = None
         self._last_time = None
         self._console_text = ''
+        self._priority = self.Priority.NONE
         # NOTE: Bias threshold value is not saved in the session currently.
         self._bias_threshold = None
 
@@ -205,6 +225,10 @@ class ManagerState(QtCore.QObject):
     @property
     def console_text(self):
         return self._console_text
+
+    @property
+    def priority(self):
+        return self._priority
 
     @property
     def bias_threshold(self):
@@ -273,6 +297,11 @@ class ManagerState(QtCore.QObject):
         self._update_stats(key)
         self._write_set_data(key)
         self.updated_signal.emit(key)
+
+    def set_priority(self, val):
+        assert val in range(self.Priority.COUNT)
+        self._priority = val
+        self.updated_signal.emit(None)
 
     def set_bias_threshold(self, val):
         self._bias_threshold = val
@@ -386,12 +415,36 @@ class ManagerState(QtCore.QObject):
         return result is not None
 
     def _choose_runnable_set(self):
-        # TODO prioritize
         runnable_sets = [k for k, v in self._hypersets.items()
                          if not v['disabled']]
         if not runnable_sets:
             return None
-        return random.choice(runnable_sets)
+        weights = numpy.array([self._get_priority_weight(k)
+                               for k in runnable_sets])
+        cum_weights = numpy.cumsum(weights)
+        rval = random.uniform(0., cum_weights[-1])
+        return runnable_sets[numpy.argmax(cum_weights >= rval)]
+
+    def _get_priority_weight(self, key):
+        data = self._hypersets[key]
+        if any(f is None for f in data.values()):
+            # Prioritize at least one interval on any new sets so we can
+            # establish some stats on which to base priority going forward.
+            return 10.
+
+        if self._priority == self.Priority.NONE:
+            weight = 1.
+        elif self._priority == self.Priority.TIME:
+            weight = 1. / data['total_training_s']
+        elif self._priority == self.Priority.RATE:
+            weight = -data['test_loss_rate']
+        elif self._priority == self.Priority.TTZ:
+            weight = -data['test_loss_rate'] / data['min_test_loss']
+        else:
+            assert False, 'Unknown priority %r' % self._priority
+
+        EPSILON = 1e-9  # Cap small/negative weights at this positive value.
+        return max(weight, EPSILON)
 
     def _find_existing_checkpoint(self, set_dir):
         checkpoints = glob.glob(os.path.join(
@@ -724,6 +777,13 @@ class MainWindow(QtWidgets.QMainWindow):
             'Run session', self._handle_run_session)
         self._stop_action = self._run_menu.addAction(
             'Stop session', self._handle_stop_session)
+        self._run_menu.addSeparator()
+        pri_menu = self._run_menu.addMenu('Prioritize by')
+        self._priority_actions = [
+            pri_menu.addAction(ManagerState.Priority.PRETTY[p],
+                               functools.partial(self._handle_priority, p))
+            for p in range(ManagerState.Priority.COUNT)]
+        [a.setCheckable(True) for a in self._priority_actions]
 
         self._status = self.statusBar()
 
@@ -749,6 +809,8 @@ class MainWindow(QtWidgets.QMainWindow):
         running = self._state.running
         self._run_action.setEnabled(not running)
         self._stop_action.setEnabled(running)
+        for i, a in enumerate(self._priority_actions):
+            a.setChecked(self._state.priority == i)
 
         self._widget.text.setEnabled(running)
         self._widget.text.setPlainText(self._state.console_text)
@@ -830,6 +892,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _handle_stop_session(self):
         self._state.stop_session()
+
+    def _handle_priority(self, priority):
+        self._state.set_priority(priority)
 
 
 if __name__ == '__main__':
