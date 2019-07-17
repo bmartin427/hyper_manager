@@ -281,11 +281,11 @@ class ManagerState(QtCore.QObject):
         if self._subprocess is not None:
             self._subprocess.terminate()
             try:
-                self._subprocess.wait(10)
+                self._subprocess.wait(20)
             except subprocess.TimeoutExpired:
                 print('Process ignored TERM, trying KILL')
                 self._subprocess.kill()
-                self._subprocess.wait(10)
+                self._subprocess.wait(20)
             assert self._update_subprocess(ignore_errors=True)
         assert self._running_set_key is None
         self._console_text = 'Not running'
@@ -435,7 +435,7 @@ class ManagerState(QtCore.QObject):
 
     def _get_priority_weight(self, key):
         data = self._hypersets[key]
-        if any(f is None for f in data.values()):
+        if any(v is None for f, v in data.items() if f != 'this_run_s'):
             # Prioritize at least one interval on any new sets so we can
             # establish some stats on which to base priority going forward.
             return 10.
@@ -497,7 +497,8 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
     _HEADERS = ['Args', 'This Run', 'Total Training',
                 'Min Test Error', 'Cur Test Error', 'Error Rate',
                 'Cur Bias', 'TTZ', 'Key']
-    _KEY_COL = _HEADERS.index('Key')
+    TTZ_COL = _HEADERS.index('TTZ')
+    KEY_COL = _HEADERS.index('Key')
 
     def __init__(self, parent, state):
         super(ManagerStateTableAdapter, self).__init__(parent)
@@ -557,7 +558,7 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
 
     # Other methods
     def get_key(self, row_index):
-        return self._data[row_index][self._KEY_COL]
+        return self._data[row_index][self.KEY_COL]
 
     def _handle_state_changed(self, key):
         def fmt_float(f):
@@ -573,10 +574,10 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
                 fmt_float(d['cur_test_loss']),
                 fmt_float(d['test_loss_rate']),
                 fmt_float(d['cur_bias']),
-                str(int(d['cur_test_loss'] / -d['test_loss_rate'])) if (
-                    (d['cur_test_loss'] is not None) and
-                    (d['test_loss_rate'] is not None) and
-                    (d['test_loss_rate'] <= 0.)) else '',
+                '' if ((d['cur_test_loss'] is None) or
+                       (d['test_loss_rate'] is None))
+                else '--' if d['test_loss_rate'] >= 0.
+                else str(int(d['cur_test_loss'] / -d['test_loss_rate'])),
                 k,
             ]
 
@@ -606,7 +607,9 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
         def key_on_ttz(k):
             error = self._state.hypersets[k]['cur_test_loss']
             rate = self._state.hypersets[k]['test_loss_rate']
-            if (error is None) or (rate is None) or (rate >= 0.):
+            if (error is None) or (rate is None):
+                return float('-inf')
+            if rate >= 0.:
                 return float('inf')
             return error / -rate
 
@@ -659,7 +662,8 @@ class HypersetTable(QtWidgets.QTableView):
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.setContextMenuPolicy(QtCore.Qt.ActionsContextMenu)
-        self.sortByColumn(3, QtCore.Qt.AscendingOrder)
+        self.sortByColumn(ManagerStateTableAdapter.TTZ_COL,
+                          QtCore.Qt.AscendingOrder)
 
     @property
     def selected_keys(self):
