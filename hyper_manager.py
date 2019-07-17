@@ -786,7 +786,6 @@ class MainWindow(QtWidgets.QMainWindow):
             'Add hyperparam set...', self._handle_add_set)
         self._bias_threshold_action = self._sets_menu.addAction(
             'Bias threshold...', self._handle_bias_threshold)
-        self._bias_threshold_action.setCheckable(True)
         self._sets_menu.addSeparator()
         self._set_actions = []
         for table_action in self._widget.table.actions():
@@ -829,8 +828,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _handle_state_updated(self, _):
         have_session = self._state.session_path is not None
         self._sets_menu.setEnabled(have_session)
-        self._bias_threshold_action.setChecked(
-            self._state.bias_threshold is not None)
         self._handle_selection_updated()
 
         self._run_menu.setEnabled(have_session)
@@ -900,20 +897,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, 'Set exists', str(e))
 
     def _handle_bias_threshold(self):
-        # This is called after the checked state has already changed.
-        if not self._bias_threshold_action.isChecked():
-            self._state.set_bias_threshold(None)
-            return
-
         val, ok = QtWidgets.QInputDialog.getDouble(
             self, 'Apply Bias Threshold',
-            'Disables running hypersets when the \'current bias\' stat '
-            'exceeds this value.  Also, the \'min error\' stat will apply to '
-            'only that part of the log before this threshold is exceeded '
-            '(requires refresh).',
-            0.5, 0., 1., 2)
+            'Disables running hypersets when the \'current bias\' stat \n'
+            'exceeds this value.  Also, the \'min error\' stat will apply \n'
+            'to only that part of the log before this threshold is exceeded \n'
+            '(requires refresh).  Set to zero to disable.',
+            (self._state.bias_threshold
+             if self._state.bias_threshold is not None else 0.),
+            0., 1., 2, QtCore.Qt.WindowFlags(), 0.1)
         if ok:
-            self._state.set_bias_threshold(val)
+            self._state.set_bias_threshold(val if val else None)
 
     def _handle_run_session(self):
         self._state.run_session()
