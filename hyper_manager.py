@@ -496,7 +496,7 @@ class ManagerState(QtCore.QObject):
 class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
     _HEADERS = ['Args', 'This Run', 'Total Training',
                 'Min Test Error', 'Cur Test Error', 'Error Rate',
-                'Cur Bias', 'Key']
+                'Cur Bias', 'TTZ', 'Key']
     _KEY_COL = _HEADERS.index('Key')
 
     def __init__(self, parent, state):
@@ -573,6 +573,10 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
                 fmt_float(d['cur_test_loss']),
                 fmt_float(d['test_loss_rate']),
                 fmt_float(d['cur_bias']),
+                str(int(d['cur_test_loss'] / -d['test_loss_rate'])) if (
+                    (d['cur_test_loss'] is not None) and
+                    (d['test_loss_rate'] is not None) and
+                    (d['test_loss_rate'] <= 0.)) else '',
                 k,
             ]
 
@@ -597,12 +601,19 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
     def _get_sorted_keys(self):
         def key_on_field(f, k):
             ret = self._state.hypersets[k][f]
-            return ret if ret is not None else -1.
+            return ret if ret is not None else float('-inf')
+
+        def key_on_ttz(k):
+            error = self._state.hypersets[k]['cur_test_loss']
+            rate = self._state.hypersets[k]['test_loss_rate']
+            if (error is None) or (rate is None) or (rate >= 0.):
+                return float('inf')
+            return error / -rate
 
         key = ([functools.partial(key_on_field, f) for f in
                 ['args', 'this_run_s', 'total_training_s', 'min_test_loss',
                  'cur_test_loss', 'test_loss_rate', 'cur_bias']] +
-               [None])[self._sort_column]
+               [key_on_ttz, None])[self._sort_column]
         return sorted(self._state.hypersets.keys(), key=key,
                       reverse=(self._sort_order == QtCore.Qt.DescendingOrder))
 
