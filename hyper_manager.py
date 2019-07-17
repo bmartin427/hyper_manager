@@ -206,7 +206,7 @@ class ManagerState(QtCore.QObject):
         self._subprocess_log = None
         self._last_time = None
         self._console_text = ''
-        self._priority = self.Priority.NONE
+        self._priority = self.Priority.TTZ
         # NOTE: Bias threshold value is not saved in the session currently.
         self._bias_threshold = None
 
@@ -266,7 +266,7 @@ class ManagerState(QtCore.QObject):
         self._hypersets[key]['disabled'] = disabled
         self._write_set_data(key)
         self.updated_signal.emit(key)
-        if self._running_set_key == key:
+        if disabled and (self._running_set_key == key):
             self.stop_session()
             self.run_session()
 
@@ -283,6 +283,7 @@ class ManagerState(QtCore.QObject):
             try:
                 self._subprocess.wait(10)
             except subprocess.TimeoutExpired:
+                print('Process ignored TERM, trying KILL')
                 self._subprocess.kill()
                 self._subprocess.wait(10)
             assert self._update_subprocess(ignore_errors=True)
@@ -379,7 +380,7 @@ class ManagerState(QtCore.QObject):
                     self._session_path, running_set_key, self._LOG_FILE),
                 'rb') as f:
             try:
-                f.seek(-10000, 2)
+                f.seek(-25000, 2)
             except OSError:
                 f.seek(0)
             # Real console output has carriage returns that overwrite lines,
@@ -396,6 +397,15 @@ class ManagerState(QtCore.QObject):
         running_set['total_training_s'] += dt
 
         if result is not None:
+            # This can end up being re-entrant if we're not careful:
+            # refreshing stats causing the running set to exceed the bias
+            # threshold, disabling it, so we stop the running set, which
+            # involves updating its stats which again tries to stop it
+            # running.  Best to indicate as soon as possible that we're not
+            # running anymore to prevent this.
+            self._subprocess = None
+            self._running_set_key = None
+
             if not ignore_errors and (result != 0):
                 print('Error %r with args %r (key %r):' %
                       (result, running_set['args'],
@@ -404,10 +414,8 @@ class ManagerState(QtCore.QObject):
                 running_set['disabled'] = True
             self._subprocess_log.write('*** END RUN at %s\n' % time.ctime())
             self._subprocess_log.close()
-            self._subprocess = None
             running_set['this_run_s'] = None
             self._update_stats(running_set_key)
-            self._running_set_key = None
             self._last_time = None
 
         self._write_set_data(running_set_key)
