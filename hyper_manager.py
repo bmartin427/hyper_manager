@@ -791,7 +791,11 @@ class MainWindow(QtWidgets.QMainWindow):
             pri_menu.addAction(ManagerState.Priority.PRETTY[p],
                                functools.partial(self._handle_priority, p))
             for p in range(ManagerState.Priority.COUNT)]
-        [a.setCheckable(True) for a in self._priority_actions]
+        group = QtWidgets.QActionGroup(self)
+        group.setExclusive(True)
+        for a in self._priority_actions:
+            a.setActionGroup(group)
+            a.setCheckable(True)
 
         self._status = self.statusBar()
 
