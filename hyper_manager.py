@@ -96,13 +96,14 @@ def _filter_log(full_log):
 
     Given input in the same form as the output of _parse_logs, returns output
     in the same form, where all columns have had a moving-average filter
-    applied which is approximately 5 minutes of training time wide.
+    applied.
     """
+    FILTER_M = 10.
     if full_log is None:
         return None
     total_m = (full_log[-1, 0] - full_log[0, 0]) / _S_M
     samples_per_m = full_log.shape[0] / total_m
-    filter_width = int(round(5. * samples_per_m))
+    filter_width = int(round(FILTER_M * samples_per_m))
     filtered = numpy.stack(
         [numpy.convolve(
             full_log[:, i], numpy.ones(filter_width) / filter_width,
@@ -451,7 +452,7 @@ class ManagerState(QtCore.QObject):
         else:
             assert False, 'Unknown priority %r' % self._priority
 
-        EPSILON = 1e-9  # Cap small/negative weights at this positive value.
+        EPSILON = 1e-7  # Cap small/negative weights at this positive value.
         return max(weight, EPSILON)
 
     def _find_existing_checkpoint(self, set_dir):
