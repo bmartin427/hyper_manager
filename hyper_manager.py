@@ -139,16 +139,11 @@ def _get_stats(full_log, filtered=None):
     min_error = numpy.amin(full_log[:, 4])
     cur_error = filtered[-1, 4]
     cur_bias = _get_bias(filtered[-1:, :])[0]
-    # Do a linear fit to the latter half of the log data, and weight the later
-    # terms more aggressively than the earlier ones.
-    #
-    # Per https://en.wikipedia.org/wiki/Weighted_least_squares the weight
-    # matrix we should use is actually the square root of the desired weights.
+    # Do a linear fit to the latter half of the log data.
     start_idx = full_log.shape[0] // 2
     data = full_log[start_idx:, :]
-    W = numpy.sqrt((numpy.arange(data.shape[0]) + 1)[:, numpy.newaxis])
-    A = W * numpy.hstack([data[:, 0:1], numpy.ones((data.shape[0], 1))])
-    B = W * data[:, 4:5]
+    A = numpy.hstack([data[:, 0:1], numpy.ones((data.shape[0], 1))])
+    B = data[:, 4:5]
     p, _, _, _ = numpy.linalg.lstsq(A, B, rcond=None)
     error_rate = p[0][0] * 60.  # Per minute not per second.
     error_intercept = p[1][0]
@@ -488,7 +483,7 @@ class ManagerState(QtCore.QObject):
         else:
             assert False, 'Unknown priority %r' % self._priority
 
-        EPSILON = 1e-7  # Cap small/negative weights at this positive value.
+        EPSILON = 1e-6  # Cap small/negative weights at this positive value.
         return max(weight, EPSILON)
 
     def _find_existing_checkpoint(self, set_dir):
@@ -506,7 +501,9 @@ class ManagerState(QtCore.QObject):
         # (Discard the intercepts.)
         full_log = self.get_history(key)
         filtered = _filter_log(full_log)
-        if self._bias_threshold is not None:
+        if (full_log is not None) and \
+           (filtered.shape[0] > 0) and \
+           (self._bias_threshold is not None):
             bias = _get_bias(filtered)
             mask = bias > self._bias_threshold
             filtered_idx = numpy.argmax(mask)
