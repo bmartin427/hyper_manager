@@ -160,6 +160,7 @@ def _get_stats(full_log, filtered=None):
 
 class ManagerState(QtCore.QObject):
     _HYPERSET_FILE = 'hyperset.json'
+    _SESSION_FILE = 'session.json'
     _LOG_FILE = 'training.log'
     _OVERWRITTEN_LINE_RE = re.compile('[^\r\n]*\r')
     _DEFAULT_DATA = {
@@ -195,7 +196,9 @@ class ManagerState(QtCore.QObject):
     # The key of a previously-existing hyperset that was updated is passed
     # through the signal.  If None, the entire table should be treated as
     # changed.
-    updated_signal = QtCore.Signal(str)
+    set_updated_signal = QtCore.Signal(str)
+    # Indicates that session properties other than set data have changed.
+    session_updated_signal = QtCore.Signal()
 
     def __init__(self):
         super(ManagerState, self).__init__()
@@ -207,8 +210,15 @@ class ManagerState(QtCore.QObject):
         self._subprocess_log = None
         self._last_time = None
         self._console_text = ''
+        self._priority = None
+        self._bias_threshold = None
+
+        self._reset()
+
+    def _reset(self):
+        self._session_path = None
+        self._hypersets = {}
         self._priority = self.Priority.TTZ
-        # NOTE: Bias threshold value is not saved in the session currently.
         self._bias_threshold = None
 
     @property
@@ -239,12 +249,14 @@ class ManagerState(QtCore.QObject):
         assert os.path.exists(path)
         if self.running:
             self.stop_session()
-        self._hypersets = {}
+        self._reset()
 
         self._session_path = path
+        self._try_load_session_props()
         for setfile in glob.glob(os.path.join(path, '*', self._HYPERSET_FILE)):
             self._load_hyperset(setfile)
-        self.updated_signal.emit(None)
+        self.set_updated_signal.emit(None)
+        self.session_updated_signal.emit()
 
     def add_hyperset(self, set_args):
         # Create a lookup key for each hyperparam set based on hashing the
@@ -261,12 +273,12 @@ class ManagerState(QtCore.QObject):
         os.mkdir(os.path.join(self._session_path, key))
         self._write_set_data(key)
         # key didn't previously exist, so reset everything.
-        self.updated_signal.emit(None)
+        self.set_updated_signal.emit(None)
 
     def disable_hyperset(self, key, disabled):
         self._hypersets[key]['disabled'] = disabled
         self._write_set_data(key)
-        self.updated_signal.emit(key)
+        self.set_updated_signal.emit(key)
         if disabled and (self._running_set_key == key):
             self.stop_session()
             self.run_session()
@@ -298,16 +310,19 @@ class ManagerState(QtCore.QObject):
     def refresh_stats(self, key):
         self._update_stats(key)
         self._write_set_data(key)
-        self.updated_signal.emit(key)
+        self.set_updated_signal.emit(key)
 
     def set_priority(self, val):
         assert val in range(self.Priority.COUNT)
         self._priority = val
-        self.updated_signal.emit(None)
+        self._save_session_props()
+        self.session_updated_signal.emit()
 
     def set_bias_threshold(self, val):
+        assert (val >= 0.) and (val <= 1.)
         self._bias_threshold = val
-        self.updated_signal.emit(None)
+        self._save_session_props()
+        self.session_updated_signal.emit()
 
     # QObject override
     def timerEvent(self, _):
@@ -345,6 +360,27 @@ class ManagerState(QtCore.QObject):
                 cmd, stdout=self._subprocess_log, stderr=subprocess.STDOUT,
                 cwd=set_wd, encoding='utf8', universal_newlines=True)
             self._last_time = time.monotonic()
+
+    def _try_load_session_props(self):
+        props_fn = os.path.join(self._session_path, self._SESSION_FILE)
+        if not os.path.exists(props_fn):
+            return
+        with open(props_fn, 'rt', encoding='utf8') as f:
+            data = json.load(f)
+        self._priority = data['priority']
+        self._bias_threshold = data['bias_threshold']
+        assert self._priority in range(self.Priority.COUNT)
+        assert (self._bias_threshold >= 0.) and (self._bias_threshold <= 1.)
+
+    def _save_session_props(self):
+        props_fn = os.path.join(self._session_path, self._SESSION_FILE)
+        with open(props_fn + '.tmp', 'wt', encoding='utf8') as f:
+            json.dump({'priority': self._priority,
+                       'bias_threshold': self._bias_threshold},
+                      f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(props_fn + '.tmp', props_fn)
 
     def _load_hyperset(self, setfile):
         with open(setfile, 'rt', encoding='utf8') as f:
@@ -420,7 +456,7 @@ class ManagerState(QtCore.QObject):
             self._last_time = None
 
         self._write_set_data(running_set_key)
-        self.updated_signal.emit(running_set_key)
+        self.set_updated_signal.emit(running_set_key)
         return result is not None
 
     def _choose_runnable_set(self):
@@ -505,7 +541,7 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
         super(ManagerStateTableAdapter, self).__init__(parent)
         self._parent = parent
         self._state = state
-        state.updated_signal.connect(self._handle_state_changed)
+        state.set_updated_signal.connect(self._handle_state_changed)
         self._data = []
         self._disabled = []
         self._sort_column = 0
@@ -767,7 +803,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle('Hyper Manager')
 
         self._state = ManagerState()
-        self._state.updated_signal.connect(self._handle_state_updated)
+        self._state.set_updated_signal.connect(self._handle_set_updated)
+        self._state.session_updated_signal.connect(
+            self._handle_session_updated)
 
         self._widget = MainWidget(self, self._state)
         self._widget.table.selection_updated_signal.connect(
@@ -817,7 +855,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if initial_session is not None:
             self._state.set_session_path(initial_session)
         else:
-            self._handle_state_updated(None)
+            self._handle_set_updated(None)
 
     # QMainWindow override
     def closeEvent(self, event):
@@ -825,12 +863,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._state.stop_session()
         super(MainWindow, self).closeEvent(event)
 
-    def _handle_state_updated(self, _):
+    def _handle_session_updated(self):
         have_session = self._state.session_path is not None
         self._sets_menu.setEnabled(have_session)
         self._handle_selection_updated()
-
         self._run_menu.setEnabled(have_session)
+
+    def _handle_set_updated(self, _):
         running = self._state.running
         self._run_action.setEnabled(not running)
         self._stop_action.setEnabled(running)
@@ -842,7 +881,7 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll = self._widget.text.verticalScrollBar()
         scroll.setValue(scroll.maximum())
 
-        if have_session:
+        if self._state.session_path is not None:
             session = os.path.basename(self._state.session_path)
             if not session:
                 session = os.path.dirname(self._state.session_path)
