@@ -81,11 +81,11 @@ def _parse_logs(logs_dir):
     return full_log
 
 
-def _get_bias(log_data):
-    """Calculate bias.
+def _get_variance(log_data):
+    """Calculate variance.
 
-    Returns the bias for each row of data provided with columns as per the
-    result of _parse_logs().  Bias is defined here as 1 - training_error /
+    Returns the variance for each row of data provided with columns as per the
+    result of _parse_logs().  Variance is defined here as 1 - training_error /
     validation_error.
     """
     return 1. - log_data[:, 3] / log_data[:, 4]
@@ -120,8 +120,8 @@ def _get_stats(full_log, filtered=None):
     a tuple of four elements:
      * Minimum validation error in the log.
      * Validation error at the end of the log.
-     * Bias (defined as 1 - training_error / validation_error) at the end of
-       the log.
+     * Variance (defined as 1 - training_error / validation_error) at the end
+       of the log.
      * The rate at which the validation error was changing towards the end of
        the log, per minute of training time.
      * The intercept of the linear fit used to estimate the error rate.
@@ -130,6 +130,7 @@ def _get_stats(full_log, filtered=None):
 
     If the filtered output is not provided, it is implicitly computed from
     full_log.
+
     """
     if full_log is None:
         return None, None, None, None, None
@@ -138,7 +139,7 @@ def _get_stats(full_log, filtered=None):
 
     min_error = numpy.amin(full_log[:, 4])
     cur_error = filtered[-1, 4]
-    cur_bias = _get_bias(filtered[-1:, :])[0]
+    cur_variance = _get_variance(filtered[-1:, :])[0]
     # Do a linear fit to the latter half of the log data.
     start_idx = full_log.shape[0] // 2
     data = full_log[start_idx:, :]
@@ -149,7 +150,7 @@ def _get_stats(full_log, filtered=None):
     error_intercept = p[1][0]
 
     return (min_error,
-            cur_error, cur_bias,
+            cur_error, cur_variance,
             error_rate, error_intercept)
 
 
@@ -163,10 +164,10 @@ class ManagerState(QtCore.QObject):
         'disabled': False,
         'this_run_s': None,
         'total_training_s': 0.,
-        'min_test_loss': None,
-        'cur_test_loss': None,
-        'test_loss_rate': None,
-        'cur_bias': None,
+        'min_test_error': None,
+        'cur_test_error': None,
+        'test_error_rate': None,
+        'cur_variance': None,
     }
 
     class Priority:
@@ -206,7 +207,7 @@ class ManagerState(QtCore.QObject):
         self._last_time = None
         self._console_text = ''
         self._priority = None
-        self._bias_threshold = None
+        self._variance_threshold = None
 
         self._reset()
 
@@ -214,7 +215,7 @@ class ManagerState(QtCore.QObject):
         self._session_path = None
         self._hypersets = {}
         self._priority = self.Priority.TTZ
-        self._bias_threshold = None
+        self._variance_threshold = None
 
     @property
     def session_path(self):
@@ -237,8 +238,8 @@ class ManagerState(QtCore.QObject):
         return self._priority
 
     @property
-    def bias_threshold(self):
-        return self._bias_threshold
+    def variance_threshold(self):
+        return self._variance_threshold
 
     def set_session_path(self, path):
         assert os.path.exists(path)
@@ -313,9 +314,10 @@ class ManagerState(QtCore.QObject):
         self._save_session_props()
         self.session_updated_signal.emit()
 
-    def set_bias_threshold(self, val):
-        assert (val >= 0.) and (val <= 1.)
-        self._bias_threshold = val
+    def set_variance_threshold(self, val):
+        if val is not None:
+            assert (val > 0.) and (val <= 1.)
+        self._variance_threshold = val
         self._save_session_props()
         self.session_updated_signal.emit()
 
@@ -362,16 +364,19 @@ class ManagerState(QtCore.QObject):
             return
         with open(props_fn, 'rt', encoding='utf8') as f:
             data = json.load(f)
-        self._priority = data['priority']
-        self._bias_threshold = data['bias_threshold']
+        self._priority = data.get('priority', self._priority)
+        self._variance_threshold = data.get('variance_threshold',
+                                            self._variance_threshold)
         assert self._priority in range(self.Priority.COUNT)
-        assert (self._bias_threshold >= 0.) and (self._bias_threshold <= 1.)
+        if self._variance_threshold is not None:
+            assert ((self._variance_threshold > 0.) and
+                    (self._variance_threshold <= 1.))
 
     def _save_session_props(self):
         props_fn = os.path.join(self._session_path, self._SESSION_FILE)
         with open(props_fn + '.tmp', 'wt', encoding='utf8') as f:
             json.dump({'priority': self._priority,
-                       'bias_threshold': self._bias_threshold},
+                       'variance_threshold': self._variance_threshold},
                       f)
             f.flush()
             os.fsync(f.fileno())
@@ -430,7 +435,7 @@ class ManagerState(QtCore.QObject):
 
         if result is not None:
             # This can end up being re-entrant if we're not careful:
-            # refreshing stats causing the running set to exceed the bias
+            # refreshing stats causing the running set to exceed the variance
             # threshold, disabling it, so we stop the running set, which
             # involves updating its stats which again tries to stop it
             # running.  Best to indicate as soon as possible that we're not
@@ -477,9 +482,9 @@ class ManagerState(QtCore.QObject):
         elif self._priority == self.Priority.TIME:
             weight = 1. / data['total_training_s']
         elif self._priority == self.Priority.RATE:
-            weight = -data['test_loss_rate']
+            weight = -data['test_error_rate']
         elif self._priority == self.Priority.TTZ:
-            weight = -data['test_loss_rate'] / data['min_test_loss']
+            weight = -data['test_error_rate'] / data['min_test_error']
         else:
             assert False, 'Unknown priority %r' % self._priority
 
@@ -503,9 +508,9 @@ class ManagerState(QtCore.QObject):
         filtered = _filter_log(full_log)
         if (full_log is not None) and \
            (filtered.shape[0] > 0) and \
-           (self._bias_threshold is not None):
-            bias = _get_bias(filtered)
-            mask = bias > self._bias_threshold
+           (self._variance_threshold is not None):
+            variance = _get_variance(filtered)
+            mask = variance > self._variance_threshold
             filtered_idx = numpy.argmax(mask)
             if mask[filtered_idx]:
                 # First disable the set.
@@ -521,8 +526,8 @@ class ManagerState(QtCore.QObject):
                 if full_idx:
                     full_log = full_log[:full_idx]
 
-        for k, v in zip(['min_test_loss', 'cur_test_loss', 'cur_bias',
-                         'test_loss_rate'],
+        for k, v in zip(['min_test_error', 'cur_test_error', 'cur_variance',
+                         'test_error_rate'],
                         _get_stats(full_log, filtered=filtered)):
             self._hypersets[key][k] = v
 
@@ -530,7 +535,7 @@ class ManagerState(QtCore.QObject):
 class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
     _HEADERS = ['Args', 'This Run', 'Total Training',
                 'Min Test Error', 'Cur Test Error', 'Error Rate',
-                'Cur Bias', 'TTZ', 'Key']
+                'Cur Variance', 'TTZ', 'Key']
     TTZ_COL = _HEADERS.index('TTZ')
     KEY_COL = _HEADERS.index('Key')
 
@@ -604,14 +609,14 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
                 (str(datetime.timedelta(seconds=round(d['this_run_s'])))
                  if d['this_run_s'] is not None else ''),
                 str(datetime.timedelta(seconds=round(d['total_training_s']))),
-                fmt_float(d['min_test_loss']),
-                fmt_float(d['cur_test_loss']),
-                fmt_float(d['test_loss_rate']),
-                fmt_float(d['cur_bias']),
-                '' if ((d['cur_test_loss'] is None) or
-                       (d['test_loss_rate'] is None))
-                else '--' if d['test_loss_rate'] >= 0.
-                else str(int(d['cur_test_loss'] / -d['test_loss_rate'])),
+                fmt_float(d['min_test_error']),
+                fmt_float(d['cur_test_error']),
+                fmt_float(d['test_error_rate']),
+                fmt_float(d['cur_variance']),
+                '' if ((d['cur_test_error'] is None) or
+                       (d['test_error_rate'] is None))
+                else '--' if d['test_error_rate'] >= 0.
+                else str(int(d['cur_test_error'] / -d['test_error_rate'])),
                 k,
             ]
 
@@ -639,8 +644,8 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
             return ret if ret is not None else float('-inf')
 
         def key_on_ttz(k):
-            error = self._state.hypersets[k]['cur_test_loss']
-            rate = self._state.hypersets[k]['test_loss_rate']
+            error = self._state.hypersets[k]['cur_test_error']
+            rate = self._state.hypersets[k]['test_error_rate']
             if (error is None) or (rate is None):
                 return float('-inf')
             if rate >= 0.:
@@ -648,8 +653,8 @@ class ManagerStateTableAdapter(QtCore.QAbstractTableModel):
             return error / -rate
 
         key = ([functools.partial(key_on_field, f) for f in
-                ['args', 'this_run_s', 'total_training_s', 'min_test_loss',
-                 'cur_test_loss', 'test_loss_rate', 'cur_bias']] +
+                ['args', 'this_run_s', 'total_training_s', 'min_test_error',
+                 'cur_test_error', 'test_error_rate', 'cur_variance']] +
                [key_on_ttz, None])[self._sort_column]
         return sorted(self._state.hypersets.keys(), key=key,
                       reverse=(self._sort_order == QtCore.Qt.DescendingOrder))
@@ -756,11 +761,11 @@ class HypersetTable(QtWidgets.QTableView):
         pyplot.subplot(2, 1, 2)
         for i, (key, (data, filtered)) in enumerate(all_data.items()):
             color = COLORS[i % len(COLORS)]
-            pyplot.plot(data[:, 0] / _S_H, _get_bias(data), color=color,
+            pyplot.plot(data[:, 0] / _S_H, _get_variance(data), color=color,
                         marker='.', linestyle='', markersize=1)
-            pyplot.plot(filtered[:, 0] / _S_H, _get_bias(filtered),
+            pyplot.plot(filtered[:, 0] / _S_H, _get_variance(filtered),
                         color=color, label=self._state.hypersets[key]['args'])
-        pyplot.title('Bias')
+        pyplot.title('Variance')
         pyplot.xlabel('Time (h)')
         pyplot.ylim(-0.1, 1.1)
         pyplot.grid()
@@ -819,8 +824,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sets_menu = self._menu.addMenu('Sets')
         self._sets_menu.addAction(
             'Add hyperparam set...', self._handle_add_set)
-        self._bias_threshold_action = self._sets_menu.addAction(
-            'Bias threshold...', self._handle_bias_threshold)
+        self._variance_threshold_action = self._sets_menu.addAction(
+            'Variance threshold...', self._handle_variance_threshold)
         self._sets_menu.addSeparator()
         self._set_actions = []
         for table_action in self._widget.table.actions():
@@ -932,18 +937,18 @@ class MainWindow(QtWidgets.QMainWindow):
             except ValueError as e:
                 QtWidgets.QMessageBox.warning(self, 'Set exists', str(e))
 
-    def _handle_bias_threshold(self):
+    def _handle_variance_threshold(self):
         val, ok = QtWidgets.QInputDialog.getDouble(
-            self, 'Apply Bias Threshold',
-            'Disables running hypersets when the \'current bias\' stat \n'
+            self, 'Apply Variance Threshold',
+            'Disables running hypersets when the \'current variance\' stat \n'
             'exceeds this value.  Also, the \'min error\' stat will apply \n'
             'to only that part of the log before this threshold is exceeded \n'
             '(requires refresh).  Set to zero to disable.',
-            (self._state.bias_threshold
-             if self._state.bias_threshold is not None else 0.),
+            (self._state.variance_threshold
+             if self._state.variance_threshold is not None else 0.),
             0., 1., 2, QtCore.Qt.WindowFlags(), 0.1)
         if ok:
-            self._state.set_bias_threshold(val if val else None)
+            self._state.set_variance_threshold(val if val else None)
 
     def _handle_run_session(self):
         self._state.run_session()
