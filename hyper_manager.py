@@ -282,6 +282,7 @@ class ManagerState(QtCore.QObject):
     def run_session(self):
         assert not self.running
         self._timer_id = self.startTimer(1000, QtCore.Qt.VeryCoarseTimer)
+        self.session_updated_signal.emit()
 
     def stop_session(self):
         assert self.running
@@ -298,6 +299,7 @@ class ManagerState(QtCore.QObject):
             assert self._update_subprocess(ignore_errors=True)
         assert self._running_set_key is None
         self._console_text = 'Not running'
+        self.session_updated_signal.emit()
 
     def get_history(self, key):
         return _parse_logs(
@@ -871,7 +873,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._handle_selection_updated()
         self._run_menu.setEnabled(have_session)
 
-    def _handle_set_updated(self, _):
         running = self._state.running
         self._run_action.setEnabled(not running)
         self._stop_action.setEnabled(running)
@@ -879,9 +880,6 @@ class MainWindow(QtWidgets.QMainWindow):
             a.setChecked(self._state.priority == i)
 
         self._widget.text.setEnabled(running)
-        self._widget.text.setPlainText(self._state.console_text)
-        scroll = self._widget.text.verticalScrollBar()
-        scroll.setValue(scroll.maximum())
 
         if self._state.session_path is not None:
             session = os.path.basename(self._state.session_path)
@@ -895,6 +893,11 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             status = 'No session loaded'
         self._status.showMessage(status)
+
+    def _handle_set_updated(self, _):
+        self._widget.text.setPlainText(self._state.console_text)
+        scroll = self._widget.text.verticalScrollBar()
+        scroll.setValue(scroll.maximum())
 
     def _handle_selection_updated(self):
         have_selection = bool(self._widget.table.selected_keys)
