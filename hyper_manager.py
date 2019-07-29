@@ -206,6 +206,7 @@ class ManagerState(QtCore.QObject):
         self._subprocess_log = None
         self._last_time = None
         self._console_text = ''
+        self._forced_run_key = None
         self._priority = None
         self._variance_threshold = None
 
@@ -214,6 +215,7 @@ class ManagerState(QtCore.QObject):
     def _reset(self):
         self._session_path = None
         self._hypersets = {}
+        self._forced_run_key = None
         self._priority = self.Priority.TTZ
         self._variance_threshold = None
 
@@ -322,6 +324,13 @@ class ManagerState(QtCore.QObject):
         self._variance_threshold = val
         self._save_session_props()
         self.session_updated_signal.emit()
+
+    def run_hyperset(self, key):
+        assert key in self._hypersets
+        if self.running:
+            self.stop_session()
+        self._forced_run_key = key
+        self.run_session()
 
     # QObject override
     def timerEvent(self, _):
@@ -462,6 +471,12 @@ class ManagerState(QtCore.QObject):
         return result is not None
 
     def _choose_runnable_set(self):
+        if self._forced_run_key is not None:
+            k = self._forced_run_key
+            self._forced_run_key = None
+            assert k in self._hypersets
+            return k
+
         runnable_sets = [k for k, v in self._hypersets.items()
                          if not v['disabled']]
         if not runnable_sets:
@@ -684,6 +699,8 @@ class HypersetTable(QtWidgets.QTableView):
             'Plot validation error', self._handle_plot_error)
         self._reset_stats_action = add_action(
             'Refresh error statistics', self._handle_refresh_stats)
+        self._run_set_action = add_action(
+            'Run this set', self._handle_run_set)
 
         self._selected_keys = []
 
@@ -718,6 +735,7 @@ class HypersetTable(QtWidgets.QTableView):
         self._disable_set_action.setChecked(
             self._state.hypersets[self._selected_keys[0]]['disabled']
             if self._selected_keys else False)
+        self._run_set_action.setEnabled(len(self._selected_keys) == 1)
         self.selection_updated_signal.emit()
 
     def _handle_model_reset(self):
@@ -778,6 +796,10 @@ class HypersetTable(QtWidgets.QTableView):
     def _handle_refresh_stats(self):
         for key in (self._selected_keys or self._state.hypersets.keys()):
             self._state.refresh_stats(key)
+
+    def _handle_run_set(self):
+        assert len(self._selected_keys) == 1
+        self._state.run_hyperset(self._selected_keys[0])
 
 
 class MainWidget(QtWidgets.QSplitter):
@@ -904,10 +926,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for my_action, table_action in self._set_actions:
             # This is a little hacky.  We want the 'disable' to be grayed out
             # with no selection, but every other action defaults to operating
-            # on every entry if there is no selection.
+            # on every entry if there is no selection, provided the table
+            # action is enabled.
             if table_action.isCheckable():
                 my_action.setEnabled(have_selection)
                 my_action.setChecked(table_action.isChecked())
+            else:
+                my_action.setEnabled(table_action.isEnabled())
 
     def _handle_new_session(self):
         dialog = QtWidgets.QFileDialog(
