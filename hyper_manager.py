@@ -881,7 +881,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if initial_session is not None:
             self._state.set_session_path(initial_session)
         else:
-            self._handle_set_updated(None)
+            self._handle_session_updated()
 
     # QMainWindow override
     def closeEvent(self, event):
