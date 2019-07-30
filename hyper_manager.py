@@ -104,6 +104,8 @@ def _filter_log(full_log):
     total_m = (full_log[-1, 0] - full_log[0, 0]) / _S_M
     samples_per_m = full_log.shape[0] / total_m
     filter_width = int(round(FILTER_M * samples_per_m))
+    if full_log.shape[0] < filter_width:
+        return numpy.array([])
     filtered = numpy.stack(
         [numpy.convolve(
             full_log[:, i], numpy.ones(filter_width) / filter_width,
@@ -132,10 +134,10 @@ def _get_stats(full_log, filtered=None):
     full_log.
 
     """
-    if full_log is None:
-        return None, None, None, None, None
-    if filtered is None:
+    if (full_log is not None) and (filtered is None):
         filtered = _filter_log(full_log)
+    if (full_log is None) or (filtered.shape[0] == 0):
+        return None, None, None, None, None
 
     min_error = numpy.amin(full_log[:, 4])
     cur_error = filtered[-1, 4]
