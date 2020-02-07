@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2019 Brad Martin.  All rights reserved.
+# Copyright 2019-2020 Brad Martin.  All rights reserved.
 
 import collections
 import datetime
@@ -20,19 +20,54 @@ from PySide2 import QtCore, QtGui, QtWidgets
 from tensorboard.backend.event_processing.event_accumulator \
     import EventAccumulator
 
-import project_paths
-
-_ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
-_CMDLINE = [os.path.join(_ROOT_DIR, 'training.py'),
-            '--dataset', os.path.join(_ROOT_DIR, 'dataset.npz'),
-            '--intervals', '6']
-
 _M_H = 60.  # minutes per hour
 _S_M = 60.  # seconds per minute
 _S_H = _S_M * _M_H  # seconds per hour
 
 
-def _parse_logs(logs_dir):
+def _parse_run_logs(run_dir, metric_name=None):
+    """Read logs for a single run.
+
+    Reads a tensorboard log directory for a single run type ('train' or
+    'validation').  Returns an Nx3 numpy array, where N is the number of
+    logged events in the log, and the 3 columns are:
+     * The absolute wall time when the event was logged,
+     * The loss,
+     * The error metric.
+    """
+    PREFIX = 'epoch_'
+    LOSS_NAME = PREFIX + 'loss'
+
+    acc = EventAccumulator(run_dir)
+    acc.Reload()
+    try:
+        loss = acc.Scalars(LOSS_NAME)
+    except KeyError:
+        return None
+    if not loss:
+        return None
+
+    if metric_name is None:
+        keys = acc.Tags()['scalars']
+        keys.remove(LOSS_NAME)
+        keys = [k for k in keys if k.startswith(PREFIX)]
+        if not keys:
+            metric_name = LOSS_NAME
+        elif len(keys) == 1:
+            metric_name = keys[0]
+        else:
+            raise RuntimeError('Multiple metrics present in logs and metric '
+                               'name not specified.')
+    else:
+        metric_name = PREFIX + metric_name
+    error = acc.Scalars(metric_name)
+
+    assert len(loss) == len(error)
+    return numpy.array([(min(l.wall_time, e.wall_time), l.value, e.value)
+                        for l, e in zip(loss, error)])
+
+
+def _parse_logs(logs_dir, metric_name=None):
     """Reads a tensorboard log directory.
 
     Returns an Nx5 numpy array, where N is the number of logged events in the
@@ -47,35 +82,25 @@ def _parse_logs(logs_dir):
     full_log = None
     try:
         for subdir in sorted(os.listdir(logs_dir)):
-            acc = EventAccumulator(os.path.join(logs_dir, subdir))
-            acc.Reload()
+            this_training = _parse_run_logs(
+                os.path.join(logs_dir, subdir, 'train'),
+                metric_name=metric_name)
+            this_validation = _parse_run_logs(
+                os.path.join(logs_dir, subdir, 'validation'),
+                metric_name=metric_name)
 
-            try:
-                train_loss = acc.Scalars('epoch_loss')
-                val_loss = acc.Scalars('epoch_val_loss')
-            except KeyError:
-                continue
-            if not train_loss or not val_loss:
-                continue
+            time_offset = rel_time - this_training[0, 0]
+            this_log = numpy.stack((this_training[:, 0] + time_offset,
+                                    this_training[:, 1],
+                                    this_validation[:, 1],
+                                    this_training[:, 2],
+                                    this_validation[:, 2]), axis=1)
+            rel_time += this_training[-1, 0] - this_training[0, 0]
 
-            try:
-                train_error = acc.Scalars('epoch_masked_mse')
-                val_error = acc.Scalars('epoch_val_masked_mse')
-            except KeyError:
-                # Some files might not log this separately.  In that case
-                # assume the loss is the error metric.
-                train_error, val_error = train_loss, val_loss
-
-            this_log = numpy.array([
-                (tl.wall_time - train_loss[0].wall_time + rel_time,
-                 tl.value, vl.value, te.value, ve.value)
-                for tl, vl, te, ve in zip(
-                        train_loss, val_loss, train_error, val_error)])
             if full_log is None:
                 full_log = this_log
             else:
                 full_log = numpy.concatenate((full_log, this_log))
-            rel_time += train_loss[-1].wall_time - train_loss[0].wall_time
     except FileNotFoundError:
         pass
     return full_log
@@ -105,7 +130,7 @@ def _filter_log(full_log):
     samples_per_m = full_log.shape[0] / total_m
     filter_width = int(round(FILTER_M * samples_per_m))
     if full_log.shape[0] < filter_width:
-        return numpy.array([])
+        return numpy.zeros((0, 5))
     filtered = numpy.stack(
         [numpy.convolve(
             full_log[:, i], numpy.ones(filter_width) / filter_width,
@@ -159,6 +184,8 @@ def _get_stats(full_log, filtered=None):
 class ManagerState(QtCore.QObject):
     _HYPERSET_FILE = 'hyperset.json'
     _SESSION_FILE = 'session.json'
+    _SESSION_PROPS = ['cmdline', 'checkpoint_dir', 'logs_dir',
+                      'priority', 'variance_threshold']
     _LOG_FILE = 'training.log'
     _OVERWRITTEN_LINE_RE = re.compile('[^\r\n]*\r')
     _DEFAULT_DATA = {
@@ -201,6 +228,12 @@ class ManagerState(QtCore.QObject):
     def __init__(self):
         super(ManagerState, self).__init__()
         self._session_path = None
+        self._cmdline = None
+        self._checkpoint_dir = None
+        self._logs_dir = None
+        self._priority = None
+        self._variance_threshold = None
+
         self._hypersets = {}
         self._timer_id = None
         self._running_set_key = None
@@ -209,17 +242,19 @@ class ManagerState(QtCore.QObject):
         self._last_time = None
         self._console_text = ''
         self._forced_run_key = None
-        self._priority = None
-        self._variance_threshold = None
 
         self._reset()
 
     def _reset(self):
         self._session_path = None
-        self._hypersets = {}
-        self._forced_run_key = None
+        self._cmdline = None
+        self._checkpoint_dir = None
+        self._logs_dir = None
         self._priority = self.Priority.TTZ
         self._variance_threshold = None
+
+        self._hypersets = {}
+        self._forced_run_key = None
 
     @property
     def session_path(self):
@@ -256,6 +291,20 @@ class ManagerState(QtCore.QObject):
         for setfile in glob.glob(os.path.join(path, '*', self._HYPERSET_FILE)):
             self._load_hyperset(setfile)
         self.set_updated_signal.emit(None)
+        self.session_updated_signal.emit()
+
+    def set_session_props(self, **kwargs):
+        for arg in self._SESSION_PROPS:
+            if arg not in kwargs:
+                continue
+            attr = '_' + arg
+            assert hasattr(self, attr)
+            setattr(self, attr, kwargs[arg])
+            kwargs.pop(arg)
+        if kwargs:
+            raise ValueError('Unknown session properties: %r' % kwargs.keys())
+        self._check_session_props()
+        self._save_session_props()
         self.session_updated_signal.emit()
 
     def add_hyperset(self, set_args):
@@ -307,25 +356,12 @@ class ManagerState(QtCore.QObject):
 
     def get_history(self, key):
         return _parse_logs(
-            os.path.join(self._session_path, key, project_paths.LOGS_DIR))
+            os.path.join(self._session_path, key, self._logs_dir))
 
     def refresh_stats(self, key):
         self._update_stats(key)
         self._write_set_data(key)
         self.set_updated_signal.emit(key)
-
-    def set_priority(self, val):
-        assert val in range(self.Priority.COUNT)
-        self._priority = val
-        self._save_session_props()
-        self.session_updated_signal.emit()
-
-    def set_variance_threshold(self, val):
-        if val is not None:
-            assert (val > 0.) and (val <= 1.)
-        self._variance_threshold = val
-        self._save_session_props()
-        self.session_updated_signal.emit()
 
     def run_hyperset(self, key):
         assert key in self._hypersets
@@ -354,7 +390,7 @@ class ManagerState(QtCore.QObject):
             assert self._subprocess is None
             set_wd = os.path.join(self._session_path, self._running_set_key)
             checkpoint = self._find_existing_checkpoint(set_wd)
-            cmd = _CMDLINE + (
+            cmd = self._cmdline + (
                 ['--resume-from', checkpoint]
                 if checkpoint is not None
                 else self._hypersets[self._running_set_key]['args'].split(' '))
@@ -377,9 +413,21 @@ class ManagerState(QtCore.QObject):
             return
         with open(props_fn, 'rt', encoding='utf8') as f:
             data = json.load(f)
-        self._priority = data.get('priority', self._priority)
-        self._variance_threshold = data.get('variance_threshold',
-                                            self._variance_threshold)
+        for prop in self._SESSION_PROPS:
+            if prop not in data:
+                continue
+            attr = '_' + prop
+            assert hasattr(self, attr)
+            setattr(self, attr, data[prop])
+        self._check_session_props()
+
+    def _check_session_props(self):
+        assert (isinstance(self._cmdline, list) and
+                (len(self._cmdline) > 0) and
+                all(isinstance(arg, str) for arg in self._cmdline))
+        assert (isinstance(self._checkpoint_dir, str) and
+                (len(self._checkpoint_dir) > 0))
+        assert isinstance(self._logs_dir, str) and (len(self._logs_dir) > 0)
         assert self._priority in range(self.Priority.COUNT)
         if self._variance_threshold is not None:
             assert ((self._variance_threshold > 0.) and
@@ -388,9 +436,9 @@ class ManagerState(QtCore.QObject):
     def _save_session_props(self):
         props_fn = os.path.join(self._session_path, self._SESSION_FILE)
         with open(props_fn + '.tmp', 'wt', encoding='utf8') as f:
-            json.dump({'priority': self._priority,
-                       'variance_threshold': self._variance_threshold},
-                      f)
+            d = dict((prop, getattr(self, '_' + prop))
+                     for prop in self._SESSION_PROPS)
+            json.dump(d, f)
             f.flush()
             os.fsync(f.fileno())
         os.rename(props_fn + '.tmp', props_fn)
@@ -511,8 +559,8 @@ class ManagerState(QtCore.QObject):
         return max(weight, EPSILON)
 
     def _find_existing_checkpoint(self, set_dir):
-        checkpoints = glob.glob(os.path.join(
-            set_dir, project_paths.CHECKPOINT_DIR, '*.json'))
+        checkpoints = glob.glob(
+            os.path.join(set_dir, self._checkpoint_dir, '*.json'))
         if not checkpoints:
             return None
         checkpoints.sort()
@@ -771,9 +819,10 @@ class HypersetTable(QtWidgets.QTableView):
                         marker='.', linestyle='', markersize=1)
             pyplot.plot(filtered[:, 0] / _S_H, filtered[:, 4], color=color,
                         label=self._state.hypersets[key]['args'])
-            pyplot.plot(data[:, 0] / _S_H,
-                        intercept + rate * data[:, 0] / _M_H,
-                        color=color, linestyle='--')
+            if rate is not None and intercept is not None:
+                pyplot.plot(data[:, 0] / _S_H,
+                            intercept + rate * data[:, 0] / _M_H,
+                            color=color, linestyle='--')
         pyplot.title('Error')
         pyplot.xlabel('Time (h)')
         pyplot.yscale('log')
@@ -823,6 +872,107 @@ class MainWidget(QtWidgets.QSplitter):
 
         self.setStretchFactor(0, 30)
         self.setStretchFactor(1, 1)
+
+
+class NewSessionDialog(QtWidgets.QDialog):
+    def __init__(self, parent):
+        super(NewSessionDialog, self).__init__(parent)
+        self.setWindowTitle('New Session Properties')
+        self._layout = QtWidgets.QFormLayout(self)
+
+        def add_edit(label=None):
+            edit = QtWidgets.QLineEdit(self)
+            if label is None:
+                self._layout.addRow(edit)
+            else:
+                self._layout.addRow(label, edit)
+            return edit
+
+        def add_browse_button(label):
+            button = QtWidgets.QPushButton('Browse...', self)
+            self._layout.addRow(label, button)
+            return button
+
+        self._name_edit = add_edit('Session name:')
+        self._path_button = add_browse_button('Session path:')
+        self._path_edit = add_edit()
+        self._exe_button = add_browse_button('Training executable:')
+        self._exe_edit = add_edit()
+        self._options_edit = add_edit('Training options:')
+        self._checkpoint_edit = add_edit('Checkpoint subdir:')
+        self._checkpoint_edit.setText('saved_models')
+        self._logs_edit = add_edit('Logs subdir:')
+        self._logs_edit.setText('logs')
+
+        self._path_button.clicked.connect(self._browse_path)
+        self._exe_button.clicked.connect(self._browse_exe)
+
+        self._button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            self)
+        self._button_box.accepted.connect(self.accept)
+        self._button_box.rejected.connect(self.reject)
+        self._layout.addRow(self._button_box)
+
+        self._ok_button = self._button_box.button(
+            QtWidgets.QDialogButtonBox.Ok)
+        self._ok_needed_edits = [self._name_edit, self._path_edit,
+                                 self._exe_edit, self._checkpoint_edit,
+                                 self._logs_edit]
+        for edit in self._ok_needed_edits:
+            edit.textChanged.connect(self._check_ok)
+        self._check_ok()
+
+        self.setLayout(self._layout)
+
+    def accept(self):
+        if not os.path.exists(self._path_edit.text()):
+            QtWidgets.QMessageBox.critical(
+                self, 'Path Not Found', 'Session path does not exist.')
+            return
+        if os.path.exists(self.session_path()):
+            QtWidgets.QMessageBox.critical(
+                self, 'Session Exists',
+                'A session with that name already exists in that location.')
+            return
+        if not os.path.exists(self._exe_edit.text()):
+            QtWidgets.QMessageBox.critical(
+                self, 'Executable Not Found',
+                'The training executable path is not valid.')
+            return
+        super(NewSessionDialog, self).accept()
+
+    def session_path(self):
+        return os.path.join(self._path_edit.text(), self._name_edit.text())
+
+    def session_props(self):
+        return {
+            'cmdline': ([self._exe_edit.text()] +
+                        self._options_edit.text().split(' ')),
+            'checkpoint_dir': self._checkpoint_edit.text(),
+            'logs_dir': self._logs_edit.text(),
+        }
+
+    def _browse_path(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            parent=self, caption='Session Path',
+            dir=os.path.dirname(self._path_edit.text()),
+            options=(QtWidgets.QFileDialog.ShowDirsOnly |
+                     QtWidgets.QFileDialog.HideNameFilterDetails))
+        if path:
+            self._path_edit.setText(path)
+
+    def _browse_exe(self):
+        exe = QtWidgets.QFileDialog.getOpenFileName(
+            parent=self, caption='Training Executable',
+            dir=os.path.dirname(self._exe_edit.text()),
+            options=QtWidgets.QFileDialog.HideNameFilterDetails)[0]
+        if exe:
+            self._exe_edit.setText(exe)
+
+    def _check_ok(self):
+        self._ok_button.setEnabled(
+            all(edit.text() for edit in self._ok_needed_edits))
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -937,21 +1087,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 my_action.setEnabled(table_action.isEnabled())
 
     def _handle_new_session(self):
-        dialog = QtWidgets.QFileDialog(
-            self, 'New session directory', project_paths.SESSIONS_DIR)
-        dialog.setAcceptMode(QtWidgets.QFileDialog.AcceptSave)
-        dialog.setFileMode(QtWidgets.QFileDialog.Directory)
-        dialog.setOption(QtWidgets.QFileDialog.ShowDirsOnly, True)
+        dialog = NewSessionDialog(self)
         if dialog.exec():
-            session_dir = dialog.selectedFiles()[0]
-            # NOTE: It seems as though the file dialog creates the directory
-            # already?
-            self._state.set_session_path(session_dir)
+            session_dir = dialog.session_path()
+            os.mkdir(session_dir)
+            self._state.set_session_path(dialog.session_path())
+            self._state.set_session_props(**dialog.session_props())
 
     def _handle_load_session(self):
         session_dir = QtWidgets.QFileDialog.getExistingDirectory(
-            self, 'Session directory', project_paths.SESSIONS_DIR,
-            QtWidgets.QFileDialog.ShowDirsOnly)
+            parent=self, caption='Session directory')
         if session_dir:
             self._state.set_session_path(session_dir)
 
@@ -978,7 +1123,8 @@ class MainWindow(QtWidgets.QMainWindow):
              if self._state.variance_threshold is not None else 0.),
             0., 1., 2, QtCore.Qt.WindowFlags(), 0.1)
         if ok:
-            self._state.set_variance_threshold(val if val else None)
+            self._state.set_session_props(
+                variance_threshold=(val if val else None))
 
     def _handle_run_session(self):
         self._state.run_session()
@@ -987,7 +1133,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._state.stop_session()
 
     def _handle_priority(self, priority):
-        self._state.set_priority(priority)
+        self._state.set_session_props(priority=priority)
 
 
 if __name__ == '__main__':
