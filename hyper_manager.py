@@ -38,6 +38,8 @@ def _parse_run_logs(run_dir, metric_name=None):
     PREFIX = 'epoch_'
     LOSS_NAME = PREFIX + 'loss'
 
+    if not os.path.exists(run_dir):
+        return None
     acc = EventAccumulator(run_dir)
     acc.Reload()
     try:
@@ -80,29 +82,28 @@ def _parse_logs(logs_dir, metric_name=None):
     """
     rel_time = 0.
     full_log = None
-    try:
-        for subdir in sorted(os.listdir(logs_dir)):
-            this_training = _parse_run_logs(
-                os.path.join(logs_dir, subdir, 'train'),
-                metric_name=metric_name)
-            this_validation = _parse_run_logs(
-                os.path.join(logs_dir, subdir, 'validation'),
-                metric_name=metric_name)
+    for subdir in sorted(os.listdir(logs_dir)):
+        this_training = _parse_run_logs(
+            os.path.join(logs_dir, subdir, 'train'),
+            metric_name=metric_name)
+        this_validation = _parse_run_logs(
+            os.path.join(logs_dir, subdir, 'validation'),
+            metric_name=metric_name)
+        if this_training is None or this_validation is None:
+            continue
 
-            time_offset = rel_time - this_training[0, 0]
-            this_log = numpy.stack((this_training[:, 0] + time_offset,
-                                    this_training[:, 1],
-                                    this_validation[:, 1],
-                                    this_training[:, 2],
-                                    this_validation[:, 2]), axis=1)
-            rel_time += this_training[-1, 0] - this_training[0, 0]
+        time_offset = rel_time - this_training[0, 0]
+        this_log = numpy.stack((this_training[:, 0] + time_offset,
+                                this_training[:, 1],
+                                this_validation[:, 1],
+                                this_training[:, 2],
+                                this_validation[:, 2]), axis=1)
+        rel_time += this_training[-1, 0] - this_training[0, 0]
 
-            if full_log is None:
-                full_log = this_log
-            else:
-                full_log = numpy.concatenate((full_log, this_log))
-    except FileNotFoundError:
-        pass
+        if full_log is None:
+            full_log = this_log
+        else:
+            full_log = numpy.concatenate((full_log, this_log))
     return full_log
 
 
@@ -400,7 +401,7 @@ class ManagerState(QtCore.QObject):
                 '*** %s RUN at %s (%r)\n' %
                 ('RESUME' if checkpoint is not None else 'START',
                  time.ctime(),
-                 "' '".join(cmd)))
+                 '" "'.join(cmd)))
             self._subprocess_log.flush()
             self._subprocess = subprocess.Popen(
                 cmd, stdout=self._subprocess_log, stderr=subprocess.STDOUT,
