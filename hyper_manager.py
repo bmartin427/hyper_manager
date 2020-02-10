@@ -391,10 +391,10 @@ class ManagerState(QtCore.QObject):
             assert self._subprocess is None
             set_wd = os.path.join(self._session_path, self._running_set_key)
             checkpoint = self._find_existing_checkpoint(set_wd)
-            cmd = self._cmdline + (
-                ['--resume-from', checkpoint]
-                if checkpoint is not None
-                else self._hypersets[self._running_set_key]['args'].split(' '))
+            cmd = (self._cmdline +
+                   self._hypersets[self._running_set_key]['args'].split(' ') +
+                   (['--resume-from', checkpoint] if checkpoint is not None
+                    else []))
             self._subprocess_log = open(os.path.join(set_wd, self._LOG_FILE),
                                         'at', encoding='utf8')
             self._subprocess_log.write(
