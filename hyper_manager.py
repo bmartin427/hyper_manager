@@ -80,6 +80,9 @@ def _parse_logs(logs_dir, metric_name=None):
      * The training error (excluding regularization penalties),
      * The validation error (excluding regularization penalties).
     """
+    if not os.path.exists(logs_dir):
+        return None
+
     rel_time = 0.
     full_log = None
     for subdir in sorted(os.listdir(logs_dir)):
@@ -124,8 +127,8 @@ def _filter_log(full_log):
     in the same form, where all columns have had a moving-average filter
     applied.
     """
-    FILTER_M = 10.
-    if full_log is None:
+    FILTER_M = 5.
+    if (full_log is None) or (full_log.shape[0] < 2):
         return None
     total_m = (full_log[-1, 0] - full_log[0, 0]) / _S_M
     samples_per_m = full_log.shape[0] / total_m
@@ -395,13 +398,14 @@ class ManagerState(QtCore.QObject):
                    self._hypersets[self._running_set_key]['args'].split(' ') +
                    (['--resume-from', checkpoint] if checkpoint is not None
                     else []))
+            cmd = [os.path.expanduser(c) for c in cmd]
             self._subprocess_log = open(os.path.join(set_wd, self._LOG_FILE),
                                         'at', encoding='utf8')
             self._subprocess_log.write(
-                '*** %s RUN at %s (%r)\n' %
+                '*** %s RUN at %s (\'%s\')\n' %
                 ('RESUME' if checkpoint is not None else 'START',
                  time.ctime(),
-                 '" "'.join(cmd)))
+                 "' '".join(cmd)))
             self._subprocess_log.flush()
             self._subprocess = subprocess.Popen(
                 cmd, stdout=self._subprocess_log, stderr=subprocess.STDOUT,
